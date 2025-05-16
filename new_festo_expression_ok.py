@@ -16,9 +16,14 @@ class FestoStation:
         self.extend_time = 2   # cylinder extend/retract time
         self.move_time = 3     # manipulator movement time
         self.vacuum_time = 2   # vacuum gripper action time
+        self.per_workpiece_refill_time = 2  # time needed to refill one workpiece
+        self.max_workpiece_capacity = 8  # maximum magazine capacity
 
         # ── Workpiece & magazine flag ──
         self.workpiece_count = 8  # initial workpiece count
+        self.refill_workpiece_count = 0  # number of workpieces to be refilled
+        self.manual_refill_flag = False  # flag for manual refill
+        self.manual_refill_amount = 0  # amount for manual refill
         self.S3 = True  # magazine non-empty
         self.k = False  # need refill
 
@@ -43,7 +48,6 @@ class FestoStation:
         self.cycle_start_time = 0  # Tracks when a cycle begins to calculate cycle time
         self.t1 = 0  # cycle time (full normal cycle)
         self.t2 = 0  # store the magazine refill time
-        self.magazine_refill_time = 10  # magazine refill wait time (default, can change)
         self.t2_start_marker = 0  # to mark when we start measuring t2
         self.first_cycle = True  # flag for first cycle
         self.cycle_blocked = False  # flag to block cycle when t2 > t1
@@ -133,7 +137,28 @@ class FestoStation:
                 # Check for emergency stop
                 if self.emergency_flag:
                     raise simpy.Interrupt()
+                
+                # check here workpiece has or not
+                if not self.S3:  # if not
+                    self.log("Magazine empty at startup, waiting for refill")
 
+                    # start measuring t2
+                    self.t2_start_marker = self.env.now
+                    self.measuring_t2 = True
+
+                    self.state = 7
+                    self.log("State 7 ▶ Magazine empty, waiting refill")
+                    self.update_logic()
+
+                    # Wait for manual refill
+                    while not self.S3:
+                        yield self.env.timeout(1)
+
+                    # wait for 3s to start cycle
+                    self.state = 8
+                    self.log("State 8 ▶ Refilled, after 3s starting cycle")
+                    yield self.env.timeout(3)
+                
                 # ── Begin normal cycle - record start time for t1 calculation ──
                 self.cycle_start_time = self.env.now
                 
@@ -172,69 +197,12 @@ class FestoStation:
                 # Pick one workpiece
                 self.workpiece_count -= 1
                 self.S3 = (self.workpiece_count > 0)
-
-                # If empty, handle magazine refill process
                 if not self.S3:
-                    # Record empty time and start measuring t2
                     self.magazine_empty_time = self.env.now
-                    self.log("Magazine became empty")
-
-                    self.t2_start_marker = self.env.now
+                    self.t2_start_marker = self.env.now  # 开始测量t2
                     self.measuring_t2 = True
-                    
-                    # Calculate t1 (cycle time up to this point)
-                    self.t1 = self.env.now - self.cycle_start_time
-                    self.log(f"Cycle time t1 = {self.t1:.1f}s")
-                    
-                    # Turn off vacuum when entering state 7
-                    self.state = 7
-                    # self.refill_in_progress = True
-                    self.log("State 7 ▶ Magazine empty, waiting refill")
-                    self.update_logic()
-
-                    # Wait for magazine refill
-                    refill_start_time = self.env.now
-                    while not self.S3:
-                        yield self.env.timeout(1)
-                    
-                    # Reset state after refill
-                    self.workpiece_count = 8  # refilled
-                    self.S3 = True
-                    self.S6 = False
-                    self.update_logic()
-                    self.state = 8
-                    self.log("State 8 ▶ Refilled, after 3s restarting")
-                    # self.refill_in_progress = False
-
-                    # Wait 3 seconds in state 8 before transition to state 1
-                    yield self.env.timeout(3)
-
-                    # Transition to state 1 (cylinder extend)
-                    self.state = 1
-                    
-                    # Calculate t2 when returning to state 1 after refill
-                    if self.measuring_t2:
-                        self.t2 = self.env.now - self.t2_start_marker # t2 = t4 + t_refill + t_wait
-                        self.measuring_t2 = False
-                        self.log(f"Calculated t2 = {self.t2:.1f}s (time from state 4 through refill back to state 1)")
-                        # 10 + 3  (yield self.env.timeout(3))
-
-                    self.update_logic()
-                    yield self.env.timeout(self.extend_time)
-                    self.S2, self.S1 = True, False
-                    self.update_logic()
-                    
-                    # Check if t2 > t1 condition for future cycles
-                    if self.t2 > self.t1:
-                        # self.log("t2 > t1: Cycle beginning will be blocked until S3 is restored")
-                        self.cycle_blocked = True
-                    else:
-                        # self.log("t1 > t2: Station will operate in normal cycle mode")
-                        self.cycle_blocked = False
-                    
-                    # No longer the first cycle
-                    self.first_cycle = False
-                    continue
+                    self.log("Magazine became empty, starting t2 measurement")
+                self.update_logic()
 
                 # ── State 5: Return to next station
                 self.state = 5
@@ -252,20 +220,12 @@ class FestoStation:
                 self.S6 = False
                 self.update_logic()
 
-                # Calculate full cycle time (t1)
-                self.t1 = self.env.now - self.cycle_start_time
-                self.log(f"Complete cycle time t1 = {self.t1:.1f}s")
-                self.first_cycle = False  # No longer the first cycle
+                # Calculate full cycle time (t1) - only on first complete cycle
+                if self.first_cycle:
+                    self.t1 = self.env.now - self.cycle_start_time
+                    self.log(f"First complete cycle time t1 = {self.t1:.1f}s")
+                    self.first_cycle = False  # No longer the first cycle
                 
-                # Compare t1 and t2 if t2 has been measured
-                # if self.t2 > 0:
-                #     if self.t2 > self.t1:
-                #         self.log(f"t2 ({self.t2:.1f}s) > t1 ({self.t1:.1f}s): Y1 = !S6 && (!k || !S4)")
-                #         self.cycle_blocked = True
-                #     else:
-                #         self.log(f"t1 ({self.t1:.1f}s) >= t2 ({self.t2:.1f}s): Y1 = !S6")
-                #         self.cycle_blocked = False
-
                 # Loop back to State 1
                 self.state = 1
                 self.update_logic()
@@ -283,37 +243,68 @@ class FestoStation:
 
             yield from self.run()
 
+    def manual_refill(self, amount):
+        """Handle manual refill request from control panel"""
+        # Only allow manual refill in state 7 (waiting for refill)
+        if self.state != 7:
+            self.log("Manual refill only available when magazine is empty (State 7)")
+            return
+            
+        if amount > 0 and amount <= self.max_workpiece_capacity:
+            self.manual_refill_flag = True
+            self.manual_refill_amount = amount
+            
+            # Calculate refill time
+            refill_time = amount * self.per_workpiece_refill_time
+            
+            # Update workpiece count and magazine status
+            self.workpiece_count = amount
+            self.S3 = True
+            self.k = not self.S3  # Update k flag
+            
+            # If we're measuring t2, update it
+            if self.measuring_t2:
+                self.t2 = refill_time
+                self.measuring_t2 = False
+                self.log(f"Manual refill: t2 = {refill_time:.1f}s for {amount} workpieces")
+            
+            self.log(f">>> Manual refill completed: {amount} workpieces added")
+            
+            # Update logic after refill
+            self.update_logic()
+
 
 # Add workpieces - modified to implement t2 logic
 def blank_generator(env, station):
-    """Refill logic based on configurable magazine refill time."""
+    """Refill logic based on number of workpieces needed."""
     while True:
-        if not station.S3:
-            # Wait exactly magazine_refill_time seconds (configurable)
-            yield env.timeout(station.magazine_refill_time)
-            
-            # Refill the magazine
-            station.S3 = True
-            station.log(f">>> Magazine refilled after {station.magazine_refill_time:.1f}s")
+        # Only check for empty magazine, don't do automatic refill
+        if not station.S3 and not station.manual_refill_flag:
+            yield env.timeout(1)  # Just wait for manual refill
         else:
             yield env.timeout(1)
+            # Reset manual refill flag after one cycle
+            station.manual_refill_flag = False
 
 
 def run_gui():
     # SimPy real-time environment
-    env = simpy.rt.RealtimeEnvironment(factor=1.0, strict=True) # 1s simulation = 1s real-time, if the simulation runs faster than real-time, an exception is raised
+    env = simpy.rt.RealtimeEnvironment(factor=1.0, strict=True)
     station = FestoStation(env)
     # Start the refill process
     env.process(blank_generator(env, station))
     threading.Thread(target=lambda: env.run(), daemon=True).start()
 
-    # Tkinter setup
+    # Tkinter setup for main window
     root = tk.Tk()
     root.title("Festo Station Simulator")
     root.protocol("WM_DELETE_WINDOW", station.trigger_exit)
 
+    # Create control panel
+    control_panel = ControlPanel(station)
+
     # Matplotlib embedding
-    fig, axs = plt.subplots(8, 1, figsize=(6, 10), sharex=True, constrained_layout=True)
+    fig, axs = plt.subplots(8, 1, figsize=(6, 12), sharex=True, constrained_layout=True)
     canvas = FigureCanvasTkAgg(fig, master=root)
     canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=1)
 
@@ -449,23 +440,125 @@ def run_gui():
         canvas.draw_idle()
 
     ani = FuncAnimation(fig, update, interval=500, cache_frame_data=False)
-
-    # Control Buttons
-    btn_frame = tk.Frame(root)
-    btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
-    button_font = ('Arial', 12)
-    
-    # Top row of buttons
-    top_btn_frame = tk.Frame(btn_frame)
-    top_btn_frame.pack(side=tk.TOP, fill=tk.X)
-    tk.Button(top_btn_frame, text="Start", command=station.trigger_start, font=button_font) \
-        .pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5, pady=5)
-    tk.Button(top_btn_frame, text="Emergency Stop", command=station.trigger_emergency, font=button_font) \
-        .pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5, pady=5)
-    tk.Button(top_btn_frame, text="Exit", command=station.trigger_exit, font=button_font) \
-        .pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5, pady=5)
     
     root.mainloop()
+
+
+class ControlPanel:
+    def __init__(self, station):
+        self.station = station
+        self.root = tk.Toplevel()
+        self.root.title("Festo Station Control Panel")
+        self.root.geometry("300x400")
+        
+        # Style configuration
+        self.style_config()
+        
+        # Create frames
+        self.create_control_frame()
+        self.create_workpiece_frame()
+        self.create_status_frame()
+        
+    def style_config(self):
+        # Configure style
+        self.root.configure(bg='#f0f0f0')
+        self.button_style = {
+            'font': ('Arial', 12),
+            'width': 15,
+            'pady': 5,
+            'bd': 2,
+            'relief': 'raised'
+        }
+        
+    def create_control_frame(self):
+        # Control buttons frame
+        control_frame = tk.LabelFrame(self.root, text="Control", padx=10, pady=5, bg='#f0f0f0')
+        control_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Start button
+        tk.Button(control_frame, 
+                 text="Start",
+                 command=self.station.trigger_start,
+                 bg='#90EE90',
+                 **self.button_style).pack(pady=5)
+        
+        # Emergency Stop button
+        tk.Button(control_frame,
+                 text="Emergency Stop",
+                 command=self.station.trigger_emergency,
+                 bg='#FFB6C1',
+                 **self.button_style).pack(pady=5)
+        
+        # Exit button
+        tk.Button(control_frame,
+                 text="Exit",
+                 command=self.station.trigger_exit,
+                 bg='#D3D3D3',
+                 **self.button_style).pack(pady=5)
+    
+    def create_workpiece_frame(self):
+        # Workpiece control frame
+        workpiece_frame = tk.LabelFrame(self.root, text="Workpiece Control", padx=10, pady=5, bg='#f0f0f0')
+        workpiece_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Refill amount selection
+        tk.Label(workpiece_frame, 
+                text="Refill Amount:",
+                bg='#f0f0f0',
+                font=('Arial', 10)).pack(pady=2)
+        
+        self.refill_var = tk.StringVar(value="8")
+        refill_spinbox = tk.Spinbox(workpiece_frame,
+                                  from_=1,
+                                  to=8,
+                                  textvariable=self.refill_var,
+                                  width=10,
+                                  font=('Arial', 12))
+        refill_spinbox.pack(pady=5)
+        
+        # Manual refill button
+        tk.Button(workpiece_frame,
+                 text="Manual Refill",
+                 command=self.manual_refill,
+                 bg='#87CEEB',
+                 **self.button_style).pack(pady=5)
+    
+    def create_status_frame(self):
+        # Status frame
+        status_frame = tk.LabelFrame(self.root, text="Status", padx=10, pady=5, bg='#f0f0f0')
+        status_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Current workpiece count
+        self.workpiece_label = tk.Label(status_frame,
+                                      text=f"Current Workpieces: {self.station.workpiece_count}",
+                                      bg='#f0f0f0',
+                                      font=('Arial', 10))
+        self.workpiece_label.pack(pady=2)
+        
+        # Update status periodically
+        self.root.after(500, self.update_status)
+    
+    def manual_refill(self):
+        try:
+            refill_amount = int(self.refill_var.get())
+            if self.station.state != 7:
+                tk.messagebox.showwarning("Invalid State", "Manual refill is only available when magazine is empty (State 7)")
+                return
+                
+            if 1 <= refill_amount <= 8:
+                self.station.manual_refill(refill_amount)
+            else:
+                tk.messagebox.showwarning("Invalid Input", "Please enter a number between 1 and 8")
+        except ValueError:
+            tk.messagebox.showwarning("Invalid Input", "Please enter a valid number")
+    
+    def update_status(self):
+        # Update workpiece count and state
+        self.workpiece_label.config(
+            text=f"Current Workpieces: {self.station.workpiece_count}\nCurrent State: {self.station.state}"
+        )
+        # Schedule next update
+        self.root.after(500, self.update_status)
 
 
 if __name__ == "__main__":
