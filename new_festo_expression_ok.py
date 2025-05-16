@@ -67,28 +67,55 @@ class FestoStation:
         # Kick off process
         self.process = env.process(self.run())
 
+        self.time_tolerance = 0.1  # 允许0.1秒的误差范围
+        self.last_logic_state = None  # 用于跟踪逻辑状态变化
+
     # Update logic expression
     def update_logic(self):
         # Based on the expression from the synthesized FSM
-        self.k = not self.S3
+        self.k = not self.S3  # k is always the inverse of S3
         
-        # Special case for initial cycle or when t1/t2 haven't been measured yet
+        # Determine current logic state
         if self.first_cycle or self.t2 == 0:
-            # Using default expression for first cycle
+            current_state = "initial"
+        elif abs(self.t1 - self.t2) <= self.time_tolerance:
+            current_state = "equal"
+        elif self.t1 > self.t2:
+            current_state = "t1_greater"
+        else:
+            current_state = "t2_greater"
+            
+        # Log only when logic state changes
+        if current_state != self.last_logic_state:
+            if current_state == "equal":
+                self.log(f"t1 ({self.t1:.1f}s) ≈ t2 ({self.t2:.1f}s)")
+            elif current_state == "t1_greater":
+                self.log(f"t1 ({self.t1:.1f}s) > t2 ({self.t2:.1f}s)")
+            elif current_state == "t2_greater":
+                self.log(f"t2 ({self.t2:.1f}s) > t1 ({self.t1:.1f}s)")
+            self.last_logic_state = current_state
+
+        # Update actuator logic based on state
+        if self.first_cycle or self.t2 == 0:
             self.Y1 = (not self.S6)
+        elif abs(self.t1 - self.t2) <= self.time_tolerance:
+            # When cycle time equals refill time, use balanced operation
+            self.Y1 = (not self.S6) and ((not self.k) or (not self.S4))
         elif self.t1 > self.t2:
             self.Y1 = (not self.S6)
-            # Normal operation when t1 > t2
-        else:
-            # When t2 > t1, the operation is blocked by magazine refill
+        else:  # t2 > t1
             self.Y1 = (not self.S6) and ((not self.k) or (not self.S4))
 
+        # Update other actuators
         self.Y2 = self.S2 or ((not self.S1) and (not self.S4))
         self.Y3 = self.S5 or (self.S1 and (not self.S4))
 
     # Record the history during simulation and output information
     def log(self, msg):  # formatted log output
         t = self.env.now
+        # Ensure k is always up to date with S3 before logging
+        self.k = not self.S3
+        
         # record history
         self.time_history.append(t)
         self.state_history.append(self.state)
@@ -129,6 +156,8 @@ class FestoStation:
             # ── State 0: Idle ──
             self.state = 0
             self.S1, self.S3, self.S4 = True, True, True
+            self.k = not self.S3  # Initialize k based on S3
+            self.cycle_start_time = 0
             self.update_logic()
             self.log("State 0 ▶ Idle (awaiting Start)")
             yield self.start_event
@@ -138,29 +167,40 @@ class FestoStation:
                 if self.emergency_flag:
                     raise simpy.Interrupt()
                 
-                # check here workpiece has or not
-                if not self.S3:  # if not
-                    self.log("Magazine empty at startup, waiting for refill")
-
-                    # start measuring t2
-                    self.t2_start_marker = self.env.now
-                    self.measuring_t2 = True
-
-                    self.state = 7
-                    self.log("State 7 ▶ Magazine empty, waiting refill")
-                    self.update_logic()
-
-                    # Wait for manual refill
-                    while not self.S3:
-                        yield self.env.timeout(1)
-
-                    # wait for 3s to start cycle
-                    self.state = 8
-                    self.log("State 8 ▶ Refilled, after 3s starting cycle")
-                    yield self.env.timeout(3)
+                # Always ensure k is up to date
+                self.k = not self.S3
                 
-                # ── Begin normal cycle - record start time for t1 calculation ──
-                self.cycle_start_time = self.env.now
+                # First check magazine status (S3)
+                if not self.S3:  # Magazine empty
+                    # Start measuring t2 if not already measuring
+                    if not self.measuring_t2:
+                        self.t2_start_marker = self.env.now
+                        self.measuring_t2 = True
+                        self.log("Starting t2 measurement")
+
+                    self.log("Magazine empty, K signal activated, waiting for manual refill")
+                    
+                    # Wait for refill
+                    while not self.S3:
+                        yield self.env.timeout(0.1)  # Reduced wait time even further for more responsive updates
+                        self.k = not self.S3  # Update k directly 
+                        self.update_logic()
+                    
+                    # Magazine refilled
+                    self.k = not self.S3  # Ensure k is updated immediately
+                    if self.measuring_t2:
+                        self.t2 = self.env.now - self.t2_start_marker
+                        self.measuring_t2 = False
+                        self.log(f"Refill completed, t2 = {self.t2:.1f}s")
+                    
+                    self.update_logic()
+                    # Reset cycle start time after refill
+                    self.cycle_start_time = self.env.now
+                    continue
+
+                # Begin normal cycle - record start time for t1 calculation if needed
+                if self.cycle_start_time == 0:
+                    self.cycle_start_time = self.env.now
                 
                 # ── State 1: Extend cylinder
                 self.state = 1
@@ -194,17 +234,13 @@ class FestoStation:
                 self.S1, self.S2 = True, False
                 self.update_logic()
 
-                # Pick one workpiece
+                # Pick one workpiece and check magazine - update all related signals at once
                 self.workpiece_count -= 1
                 self.S3 = (self.workpiece_count > 0)
-                if not self.S3:
-                    self.magazine_empty_time = self.env.now
-                    self.t2_start_marker = self.env.now  # 开始测量t2
-                    self.measuring_t2 = True
-                    self.log("Magazine became empty, starting t2 measurement")
-                self.update_logic()
-
-                # ── State 5: Return to next station
+                self.k = not self.S3  # Immediately update k when S3 changes
+                self.update_logic()  # Update logic immediately after signal changes
+                
+                # Complete current cycle
                 self.state = 5
                 self.log("State 5 ▶ Manipulator returning to next station")
                 self.update_logic()
@@ -212,42 +248,42 @@ class FestoStation:
                 self.S4, self.S5 = True, False
                 self.update_logic()
 
-                # ── State 6: Vacuum OFF
                 self.state = 6
                 self.log("State 6 ▶ Vacuum OFF")
                 self.update_logic()
-                yield self.env.timeout(self.vacuum_time) # delay time, 2s to state 1
+                yield self.env.timeout(self.vacuum_time)
                 self.S6 = False
                 self.update_logic()
 
-                # Calculate full cycle time (t1) - only on first complete cycle
+                # Calculate t1 only if it hasn't been calculated yet (first cycle)
                 if self.first_cycle:
                     self.t1 = self.env.now - self.cycle_start_time
                     self.log(f"First complete cycle time t1 = {self.t1:.1f}s")
-                    self.first_cycle = False  # No longer the first cycle
+                    self.first_cycle = False
                 
-                # Loop back to State 1
-                self.state = 1
-                self.update_logic()
-                
+                # Reset cycle start time for next cycle
+                self.cycle_start_time = self.env.now
+
         except simpy.Interrupt:
             # Emergency-stop handling: only done once per emergency
             self.state = 0
             # turn everything off / state
             self.S1 = True; self.S2 = False
             self.S4 = True; self.S5 = False; self.S6 = False
+            self.k = False  # Reset refill signal
             self.update_logic()
             self.log("Reset to State 0")
             self.emergency_flag = False
             self.start_event = self.env.event()  # reset start
+            self.cycle_start_time = 0  # Reset cycle time
 
             yield from self.run()
 
     def manual_refill(self, amount):
         """Handle manual refill request from control panel"""
-        # Only allow manual refill in state 7 (waiting for refill)
-        if self.state != 7:
-            self.log("Manual refill only available when magazine is empty (State 7)")
+        # Check if magazine is empty (S3 is False)
+        if self.S3:
+            self.log("Manual refill only available when magazine is empty")
             return
             
         if amount > 0 and amount <= self.max_workpiece_capacity:
@@ -260,7 +296,7 @@ class FestoStation:
             # Update workpiece count and magazine status
             self.workpiece_count = amount
             self.S3 = True
-            self.k = not self.S3  # Update k flag
+            self.k = not self.S3  # Immediately update k when S3 changes
             
             # If we're measuring t2, update it
             if self.measuring_t2:
@@ -541,8 +577,8 @@ class ControlPanel:
     def manual_refill(self):
         try:
             refill_amount = int(self.refill_var.get())
-            if self.station.state != 7:
-                tk.messagebox.showwarning("Invalid State", "Manual refill is only available when magazine is empty (State 7)")
+            if self.station.S3:  # Changed condition to check S3 directly
+                tk.messagebox.showwarning("Invalid State", "Manual refill is only available when magazine is empty")
                 return
                 
             if 1 <= refill_amount <= 8:
@@ -554,9 +590,11 @@ class ControlPanel:
     
     def update_status(self):
         # Update workpiece count and state
-        self.workpiece_label.config(
-            text=f"Current Workpieces: {self.station.workpiece_count}\nCurrent State: {self.station.state}"
-        )
+        status_text = f"Current Workpieces: {self.station.workpiece_count}\n"
+        status_text += f"Current State: {self.station.state}\n"
+        status_text += f"Magazine Status: {'Empty' if not self.station.S3 else 'Has Workpieces'}"
+        
+        self.workpiece_label.config(text=status_text)
         # Schedule next update
         self.root.after(500, self.update_status)
 
