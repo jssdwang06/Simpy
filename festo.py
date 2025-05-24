@@ -26,6 +26,7 @@ class FestoStation:
         self.manual_refill_amount = 0  # amount for manual refill
         self.S3 = True  # magazine non-empty
         self.k = False  # need refill
+        self.P = False  # memory unit for empty magazine notification
 
         # ── Position sensors ──
         self.S1 = True   # cylinder retracted
@@ -43,7 +44,7 @@ class FestoStation:
         self.state = 0  # initial state
         self.emergency_flag = False     # emergency stop
         self.start_event = env.event()  # start event
-        
+
         # ── Timing measurements ──
         self.cycle_start_time = 0  # Tracks when a cycle begins to calculate cycle time
         self.first_cycle = True  # flag for first cycle
@@ -52,9 +53,9 @@ class FestoStation:
         self.time_history = []
         self.state_history = []
         self.workpiece_history = []
-        self.sensor_history = {s: [] for s in ['S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'k']}
+        self.sensor_history = {s: [] for s in ['S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'k', 'P']}
         self.act_history = {a: [] for a in ['Y1', 'Y2', 'Y3']}
-        
+
         # Kick off process
         self.process = env.process(self.run())
 
@@ -83,7 +84,7 @@ class FestoStation:
         t = self.env.now
         # Ensure k is always up to date with S3 before logging
         self.k = not self.S3
-        
+
         # record history
         self.time_history.append(t)
         self.state_history.append(self.state)
@@ -126,6 +127,7 @@ class FestoStation:
             self.S5 = False
             self.S6 = False
             self.k = not self.S3
+            # P signal remains as initialized (False for full magazine)
             self.cycle_start_time = 0
             self.update_logic()
             self.log("State 0 ▶ Idle (awaiting Start)")
@@ -136,7 +138,7 @@ class FestoStation:
                     raise simpy.Interrupt()
                 self.k = not self.S3
                 if not self.S3:
-                    self.log("Magazine empty, K signal activated, waiting for manual refill")
+                    # self.log("Magazine empty, K signal activated, waiting for manual refill")
                     while not self.S3:
                         yield self.env.timeout(0.1)
                         self.k = not self.S3
@@ -195,10 +197,46 @@ class FestoStation:
                 self.log("State 4 ▶ Cylinder retracting")
                 yield self.env.timeout(self.extend_time)
 
+                # 工件在气缸收回后因重力掉落
+                if self.workpiece_count == 1:  # 弹出前是最后一个工件
+                    self.P = True  # 置位P信号
+                    self.log("Last workpiece ejected - P signal activated")
+
+                self.workpiece_count -= 1
+                self.S3 = (self.workpiece_count > 0)
+                self.k = not self.S3
+                self.update_logic()
+                # self.log(f"Workpiece ejected by gravity - Count: {self.workpiece_count}")
+
+                # 检查料仓是否为空，如果为空则完成当前循环后停止
+                if not self.S3:
+                    # ── State 5: Manipulator returning to next station ──
+                    self.state = 5
+                    self.S1 = True
+                    self.S5 = False
+                    self.update_logic()
+                    self.log("State 5 ▶ Manipulator returning to next station")
+                    yield self.env.timeout(self.move_time)
+                    self.S4 = True
+                    self.update_logic()
+
+                    # ── State 6: Vacuum OFF ──
+                    self.state = 6
+                    self.S6 = False
+                    self.S5 = False
+                    self.update_logic()
+                    self.log("State 6 ▶ Vacuum OFF")
+                    yield self.env.timeout(self.vacuum_time)
+                    self.update_logic()
+
+                    # 料仓空，跳出循环等待补料
+                    self.log("Magazine empty, waiting for manual refill")
+                    continue
+
                 # ── State 5: Manipulator returning to next station ──
                 self.state = 5
                 self.S1 = True
-                self.S3 = True
+                # S3 should already be correctly set based on workpiece_count in State 4
                 self.S5 = False
                 self.update_logic()
                 self.log("State 5 ▶ Manipulator returning to next station")
@@ -215,12 +253,6 @@ class FestoStation:
                 yield self.env.timeout(self.vacuum_time)
                 self.update_logic()
 
-                # 出料
-                self.workpiece_count -= 1
-                self.S3 = (self.workpiece_count > 0)
-                self.k = not self.S3
-                self.update_logic()
-
                 # Reset cycle start time for next cycle
                 self.cycle_start_time = self.env.now
 
@@ -231,6 +263,7 @@ class FestoStation:
             self.S5 = False
             self.S6 = False
             self.k = False
+            self.P = False  # Reset P signal on emergency stop
             self.update_logic()
             self.log("Reset to State 0")
             self.emergency_flag = False
@@ -251,6 +284,12 @@ class FestoStation:
             self.workpiece_count = amount
             self.S3 = True
             self.k = not self.S3  # Immediately update k when S3 changes
+
+            # Reset P signal when refill is completed
+            if self.P:
+                self.P = False
+                self.log("P signal reset - Magazine refilled")
+
             self.log(f">>> Manual refill completed: {amount} workpieces added")
             # 回到Idle，等待人工再次启动
             self.state = 0
@@ -260,7 +299,7 @@ class FestoStation:
             self.S6 = False
             self.start_event = self.env.event()
             self.update_logic()
-            self.log("State 0 ▶ Idle (awaiting Start)")
+            # Note: State 0 log will be output by the main loop
 
 
 # Add workpieces
@@ -346,7 +385,7 @@ def run_gui():
         ax = axs[2]
         ax.cla()
         ax.step(t, station.sensor_history['S1'], where='post', label='S1', color='red')
-        ax.step(t, station.sensor_history['S2'], where='post', label='S2', color='blue')        
+        ax.step(t, station.sensor_history['S2'], where='post', label='S2', color='blue')
         ax.legend(loc='upper right', bbox_to_anchor=(1.2, 1))
         ax.set_ylim(-0.1, 1.1)
         ax.set_yticks([0, 1])
@@ -358,7 +397,7 @@ def run_gui():
         ax = axs[3]
         ax.cla()
         ax.step(t, station.sensor_history['S4'], where='post', label='S4', color='green')
-        ax.step(t, station.sensor_history['S5'], where='post', label='S5', color='orange')        
+        ax.step(t, station.sensor_history['S5'], where='post', label='S5', color='orange')
         ax.legend(loc='upper right', bbox_to_anchor=(1.2, 1))
         ax.set_ylim(-0.1, 1.1)
         ax.set_yticks([0, 1])
@@ -377,16 +416,17 @@ def run_gui():
         ax.set_ylabel('Status')
         ax.set_title('Vacuum status (Sensor S6)')
 
-        # Sensors S3 and k subplot
+        # Sensors S3, k and P subplot
         ax = axs[5]
         ax.cla()
         ax.step(t, station.sensor_history['S3'], where='post', label='S3', color='gold')
         ax.step(t, station.sensor_history['k'], where='post', label='k', color='purple')
+        ax.step(t, station.sensor_history['P'], where='post', label='P', color='red', linestyle='--', linewidth=2)
         ax.set_ylim(-0.1, 1.1)
         ax.set_yticks([0, 1])
         ax.set_yticklabels(['0', '1'])
         ax.set_ylabel('Status')
-        ax.set_title('Magazine status (Sensors S3 and k)')
+        ax.set_title('Magazine status (Sensors S3, k and P)')
         ax.legend(loc='upper right', bbox_to_anchor=(1.2, 1))
 
         # Actuators subplot
@@ -400,11 +440,11 @@ def run_gui():
         ax.set_yticks([0, 1])
         ax.set_yticklabels(['0', '1'])
         ax.set_ylabel('Status')
-       
+
         canvas.draw_idle()
 
     ani = FuncAnimation(fig, update, interval=500, cache_frame_data=False)
-    
+
     root.mainloop()
 
 
@@ -414,7 +454,7 @@ class ControlPanel:
         self.root = tk.Toplevel()
         self.root.title("Festo Station Control Panel")
         self.root.geometry("600x500")
-        
+
         # Style configuration
         self.style_config()
 
@@ -423,15 +463,15 @@ class ControlPanel:
         self.actuator_indicators = {}
         self.workpiece_label = None # Initialize
         self.state_label = None     # Initialize
-        
+
         # Create frames
         self.create_control_frame()
         self.create_workpiece_frame()
         self.create_combined_status_frame() # Renamed and will be modified
-        
+
         # Start the status update loop
         self.root.after(500, self.update_status)
-        
+
     def style_config(self):
         # Configure style
         self.root.configure(bg='#f0f0f0')
@@ -444,64 +484,67 @@ class ControlPanel:
         }
         self.label_font = ('Arial', 12) # Further increased standard label font
         self.labelframe_font = ('Arial', 13, 'bold') # Further increased LabelFrame title font
-        
+
     def create_control_frame(self):
         # Control buttons frame
         control_frame = tk.LabelFrame(self.root, text="Control", padx=10, pady=5, bg='#f0f0f0', font=self.labelframe_font)
         control_frame.pack(fill=tk.X, padx=10, pady=5)
-        
+
         # Start button
-        tk.Button(control_frame, 
+        tk.Button(control_frame,
                  text="Start",
                  command=self.station.trigger_start,
                  bg='#90EE90',
                  **self.button_style).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5, pady=5)
-        
+
         # Emergency Stop button
         tk.Button(control_frame,
                  text="Emergency Stop",
                  command=self.station.trigger_emergency,
                  bg='#FFB6C1',
                  **self.button_style).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5, pady=5)
-        
+
         # Exit button
         tk.Button(control_frame,
                  text="Exit",
                  command=self.station.trigger_exit,
                  bg='#D3D3D3',
                  **self.button_style).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5, pady=5)
-    
+
     def create_workpiece_frame(self):
         # Workpiece control frame
         workpiece_frame = tk.LabelFrame(self.root, text="Workpiece Control", padx=10, pady=5, bg='#f0f0f0', font=self.labelframe_font)
         workpiece_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        # Inner frame for horizontal layout
+        # Inner frame for grid layout to align with status frame
         inner_wp_frame = tk.Frame(workpiece_frame, bg='#f0f0f0')
-        inner_wp_frame.pack(pady=5)
-        
-        # Refill amount selection
-        tk.Label(inner_wp_frame, 
+        inner_wp_frame.pack(pady=5, fill=tk.X)
+
+        # Refill amount selection - using grid layout for alignment
+        tk.Label(inner_wp_frame,
                 text="Refill Amount:",
                 bg='#f0f0f0',
-                font=self.label_font).pack(side=tk.LEFT, padx=(0,5))
-        
+                font=self.label_font).grid(row=0, column=0, sticky='w')
+
         self.refill_var = tk.StringVar(value="8")
         refill_spinbox = tk.Spinbox(inner_wp_frame,
                                   from_=1,
                                   to=8,
                                   textvariable=self.refill_var,
-                                  width=5, # Adjusted width for horizontal layout
+                                  width=5,
                                   font=self.label_font)
-        refill_spinbox.pack(side=tk.LEFT, padx=(0,10))
-        
+        refill_spinbox.grid(row=0, column=1, sticky='w', padx=5)
+
         # Manual refill button
         tk.Button(inner_wp_frame,
                  text="Manual Refill",
                  command=self.manual_refill,
                  bg='#87CEEB',
-                 **self.button_style).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(5,0))
-    
+                 **self.button_style).grid(row=0, column=2, sticky='ew', padx=(10,0))
+
+        # Configure column weights for proper expansion
+        inner_wp_frame.columnconfigure(2, weight=1)
+
     def create_combined_status_frame(self): # Was create_io_status_frame
         combined_status_frame = tk.LabelFrame(self.root, text="Status", padx=10, pady=10, bg='#f0f0f0', font=self.labelframe_font) # Changed title
         combined_status_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -509,11 +552,11 @@ class ControlPanel:
         # --- General Status (Workpieces, State) ---
         general_status_frame = tk.Frame(combined_status_frame, bg='#f0f0f0')
         general_status_frame.pack(fill=tk.X, pady=(0,10))
-        
+
         tk.Label(general_status_frame, text="Current Workpieces:", font=self.label_font, bg='#f0f0f0').grid(row=0, column=0, sticky='w')
         self.workpiece_label = tk.Label(general_status_frame, text="N/A", font=self.label_font, bg='#f0f0f0')
         self.workpiece_label.grid(row=0, column=1, sticky='w', padx=5)
-        
+
         tk.Label(general_status_frame, text="Current State:", font=self.label_font, bg='#f0f0f0').grid(row=1, column=0, sticky='w')
         self.state_label = tk.Label(general_status_frame, text="N/A", font=self.label_font, bg='#f0f0f0')
         self.state_label.grid(row=1, column=1, sticky='w', padx=5)
@@ -521,18 +564,18 @@ class ControlPanel:
         # --- Sensors ---
         sensors_frame = tk.Frame(combined_status_frame, bg='#f0f0f0') # Changed parent to combined_status_frame
         sensors_frame.pack(fill=tk.X)
-        
+
         tk.Label(sensors_frame, text="Sensors:", font=self.labelframe_font, bg='#f0f0f0').grid(row=0, column=0, columnspan=8, sticky='w', pady=(0,5))
 
         sensor_list_row1 = ['S1', 'S2', 'S3', 'S4']
-        sensor_list_row2 = ['S5', 'S6', 'k']
-        
+        sensor_list_row2 = ['S5', 'S6', 'k', 'P']
+
         for i, s_name in enumerate(sensor_list_row1):
             tk.Label(sensors_frame, text=f"{s_name}:", font=self.label_font, bg='#f0f0f0').grid(row=1, column=i*2, sticky='e', padx=(5,0))
             indicator = tk.Label(sensors_frame, text="  ", bg="red", width=2, relief="sunken", borderwidth=1)
             indicator.grid(row=1, column=i*2+1, sticky='w', padx=(2,10))
             self.sensor_indicators[s_name] = indicator
-            
+
         for i, s_name in enumerate(sensor_list_row2):
             tk.Label(sensors_frame, text=f"{s_name}:", font=self.label_font, bg='#f0f0f0').grid(row=2, column=i*2, sticky='e', padx=(5,0), pady=(5,0))
             indicator = tk.Label(sensors_frame, text="  ", bg="red", width=2, relief="sunken", borderwidth=1)
@@ -544,33 +587,33 @@ class ControlPanel:
         actuators_frame.pack(fill=tk.X, pady=(10,0))
 
         tk.Label(actuators_frame, text="Actuators:", font=self.labelframe_font, bg='#f0f0f0').grid(row=0, column=0, columnspan=6, sticky='w', pady=(0,5))
-        
+
         actuator_list = ['Y1', 'Y2', 'Y3']
         for i, a_name in enumerate(actuator_list):
             tk.Label(actuators_frame, text=f"{a_name}:", font=self.label_font, bg='#f0f0f0').grid(row=1, column=i*2, sticky='e', padx=(5,0))
             indicator = tk.Label(actuators_frame, text="  ", bg="red", width=2, relief="sunken", borderwidth=1)
             indicator.grid(row=1, column=i*2+1, sticky='w', padx=(2,10))
             self.actuator_indicators[a_name] = indicator
-    
+
     def manual_refill(self):
         try:
             refill_amount = int(self.refill_var.get())
             if self.station.S3:  # Changed condition to check S3 directly
                 tk.messagebox.showwarning("Invalid State", "Manual refill is only available when magazine is empty")
                 return
-                
+
             if 1 <= refill_amount <= 8:
                 self.station.manual_refill(refill_amount)
             else:
                 tk.messagebox.showwarning("Invalid Input", "Please enter a number between 1 and 8")
         except ValueError:
             tk.messagebox.showwarning("Invalid Input", "Please enter a valid number")
-    
+
     def update_status(self):
         # Update workpiece count and state
         self.workpiece_label.config(text=f"{self.station.workpiece_count}")
         self.state_label.config(text=f"{self.station.state}")
-        
+
         # Update sensor indicators
         for s_name, indicator_label in self.sensor_indicators.items():
             status = getattr(self.station, s_name, False) # Default to False if attr not found
@@ -582,11 +625,11 @@ class ControlPanel:
             status = getattr(self.station, a_name, False) # Default to False if attr not found
             color = "green" if status else "red"
             indicator_label.config(bg=color)
-            
+
         # Schedule next update
         self.root.after(100, self.update_status)
 
 
 if __name__ == "__main__":
     run_gui()
-    
+
