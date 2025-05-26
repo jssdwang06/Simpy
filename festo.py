@@ -6,7 +6,10 @@ import matplotlib.pyplot as plt  # for plotting
 from matplotlib.animation import FuncAnimation  # for animation
 
 import tkinter as tk  # for GUI
+import tkinter.messagebox
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import json
+import datetime
 
 
 class FestoStation:
@@ -49,6 +52,17 @@ class FestoStation:
         self.cycle_start_time = 0  # Tracks when a cycle begins to calculate cycle time
         self.first_cycle = True  # flag for first cycle
 
+        # ── Performance metrics ──
+        self.total_workpieces_processed = 0  # Total workpieces processed
+        self.total_cycles_completed = 0  # Total complete cycles
+        self.simulation_start_time = 0  # When simulation actually started
+        self.total_downtime = 0  # Total time waiting for refill
+        self.downtime_start = 0  # When current downtime started
+        self.cycle_times = []  # List of individual cycle times
+        self.refill_times = []  # List of refill durations
+        self.state_durations = {i: 0 for i in range(7)}  # Time spent in each state
+        self.last_state_change_time = 0  # Track state change timing
+
         # Histories for plotting
         self.time_history = []
         self.state_history = []
@@ -61,6 +75,48 @@ class FestoStation:
 
         self.time_tolerance = 0.1  # 允许0.1秒的误差范围
         self.last_logic_state = None  # 用于跟踪逻辑状态变化
+
+    def update_state_duration(self, new_state):
+        """Update the duration spent in the current state"""
+        current_time = self.env.now
+        if self.last_state_change_time > 0:
+            duration = current_time - self.last_state_change_time
+            if self.state in self.state_durations:
+                self.state_durations[self.state] += duration
+        self.last_state_change_time = current_time
+
+    def get_performance_metrics(self):
+        """Calculate and return current performance metrics"""
+        current_time = self.env.now
+
+        # Calculate total simulation time
+        total_sim_time = current_time - self.simulation_start_time if self.simulation_start_time > 0 else 0
+
+        # Calculate throughput (workpieces per hour)
+        throughput = (self.total_workpieces_processed / total_sim_time * 3600) if total_sim_time > 0 else 0
+
+        # Calculate average cycle time
+        avg_cycle_time = sum(self.cycle_times) / len(self.cycle_times) if self.cycle_times else 0
+
+        # Calculate equipment utilization (active time / total time)
+        active_time = total_sim_time - self.total_downtime
+        utilization = (active_time / total_sim_time * 100) if total_sim_time > 0 else 0
+
+        # Calculate average refill time
+        avg_refill_time = sum(self.refill_times) / len(self.refill_times) if self.refill_times else 0
+
+        return {
+            'total_sim_time': total_sim_time,
+            'total_workpieces': self.total_workpieces_processed,
+            'total_cycles': self.total_cycles_completed,
+            'throughput': throughput,
+            'avg_cycle_time': avg_cycle_time,
+            'utilization': utilization,
+            'total_downtime': self.total_downtime,
+            'avg_refill_time': avg_refill_time,
+            'refill_count': len(self.refill_times),
+            'state_durations': self.state_durations.copy()
+        }
 
     # Update logic expression
     def update_logic(self):
@@ -98,6 +154,10 @@ class FestoStation:
         if self.state == 0:
             try:
                 self.start_event.succeed()
+                # Initialize simulation start time when first started
+                if self.simulation_start_time == 0:
+                    self.simulation_start_time = self.env.now
+                    self.last_state_change_time = self.env.now
                 print(">>> System start!")
 
             except RuntimeError:
@@ -121,6 +181,7 @@ class FestoStation:
     def run(self):
         try:
             # ── State 0: Idle ──
+            self.update_state_duration(0)
             self.state = 0
             self.S1, self.S3, self.S4 = True, True, True
             self.S2 = False
@@ -138,16 +199,28 @@ class FestoStation:
                     raise simpy.Interrupt()
                 self.k = not self.S3
                 if not self.S3:
+                    # Start tracking downtime
+                    if self.downtime_start == 0:
+                        self.downtime_start = self.env.now
                     # self.log("Magazine empty, K signal activated, waiting for manual refill")
                     while not self.S3:
                         yield self.env.timeout(0.1)
                         self.k = not self.S3
                         self.update_logic()
+
+                    # End tracking downtime
+                    if self.downtime_start > 0:
+                        downtime_duration = self.env.now - self.downtime_start
+                        self.total_downtime += downtime_duration
+                        self.refill_times.append(downtime_duration)
+                        self.downtime_start = 0
+
                     self.k = not self.S3
                     self.update_logic()
                     self.cycle_start_time = 0
 
                     # return to state 0, waiting for manual start
+                    self.update_state_duration(0)
                     self.state = 0
                     self.S1, self.S3, self.S4 = True, True, True
                     self.S2 = False
@@ -162,6 +235,7 @@ class FestoStation:
                     self.cycle_start_time = self.env.now
 
                 # ── State 1: Extend cylinder ──
+                self.update_state_duration(1)
                 self.state = 1
                 self.S1 = False
                 self.S2 = False
@@ -171,6 +245,7 @@ class FestoStation:
                 yield self.env.timeout(self.extend_time)
 
                 # ── State 2: Move to magazine ──
+                self.update_state_duration(2)
                 self.state = 2
                 self.S2 = True
                 self.S4 = False
@@ -181,6 +256,7 @@ class FestoStation:
                 self.update_logic()
 
                 # ── State 3: Vacuum ON ──
+                self.update_state_duration(3)
                 self.state = 3
                 self.S6 = True
                 self.update_logic()
@@ -188,6 +264,7 @@ class FestoStation:
                 yield self.env.timeout(self.vacuum_time)
 
                 # ── State 4: Retract cylinder ──
+                self.update_state_duration(4)
                 self.state = 4
                 self.S1 = False
                 self.S2 = False
@@ -203,6 +280,7 @@ class FestoStation:
                     self.log("Last workpiece ejected - P signal activated")
 
                 self.workpiece_count -= 1
+                self.total_workpieces_processed += 1  # Track processed workpieces
                 self.S3 = (self.workpiece_count > 0)
                 self.k = not self.S3
                 self.update_logic()
@@ -211,6 +289,7 @@ class FestoStation:
                 # 检查料仓是否为空，如果为空则完成当前循环后停止
                 if not self.S3:
                     # ── State 5: Manipulator returning to next station ──
+                    self.update_state_duration(5)
                     self.state = 5
                     self.S1 = True
                     self.S5 = False
@@ -221,6 +300,7 @@ class FestoStation:
                     self.update_logic()
 
                     # ── State 6: Vacuum OFF ──
+                    self.update_state_duration(6)
                     self.state = 6
                     self.S6 = False
                     self.S5 = False
@@ -229,11 +309,18 @@ class FestoStation:
                     yield self.env.timeout(self.vacuum_time)
                     self.update_logic()
 
+                    # Complete cycle and record cycle time
+                    if self.cycle_start_time > 0:
+                        cycle_time = self.env.now - self.cycle_start_time
+                        self.cycle_times.append(cycle_time)
+                        self.total_cycles_completed += 1
+
                     # 料仓空，跳出循环等待补料
                     self.log("Magazine empty, waiting for manual refill")
                     continue
 
                 # ── State 5: Manipulator returning to next station ──
+                self.update_state_duration(5)
                 self.state = 5
                 self.S1 = True
                 # S3 should already be correctly set based on workpiece_count in State 4
@@ -245,6 +332,7 @@ class FestoStation:
                 self.update_logic()
 
                 # ── State 6: Vacuum OFF ──
+                self.update_state_duration(6)
                 self.state = 6
                 self.S6 = False
                 self.S5 = False
@@ -252,6 +340,12 @@ class FestoStation:
                 self.log("State 6 ▶ Vacuum OFF")
                 yield self.env.timeout(self.vacuum_time)
                 self.update_logic()
+
+                # Complete cycle and record cycle time
+                if self.cycle_start_time > 0:
+                    cycle_time = self.env.now - self.cycle_start_time
+                    self.cycle_times.append(cycle_time)
+                    self.total_cycles_completed += 1
 
                 # Reset cycle start time for next cycle
                 self.cycle_start_time = self.env.now
@@ -490,26 +584,43 @@ class ControlPanel:
         control_frame = tk.LabelFrame(self.root, text="Control", padx=10, pady=5, bg='#f0f0f0', font=self.labelframe_font)
         control_frame.pack(fill=tk.X, padx=10, pady=5)
 
+        # Create two rows of buttons for better layout
+        # First row: Start, Emergency Stop
+        first_row = tk.Frame(control_frame, bg='#f0f0f0')
+        first_row.pack(fill=tk.X, pady=(0, 5))
+
         # Start button
-        tk.Button(control_frame,
+        tk.Button(first_row,
                  text="Start",
                  command=self.station.trigger_start,
-                 bg='#90EE90',
-                 **self.button_style).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5, pady=5)
+                 bg='#98FB98',
+                 **self.button_style).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
 
         # Emergency Stop button
-        tk.Button(control_frame,
+        tk.Button(first_row,
                  text="Emergency Stop",
                  command=self.station.trigger_emergency,
                  bg='#FFB6C1',
-                 **self.button_style).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5, pady=5)
+                 **self.button_style).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
 
-        # Exit button
-        tk.Button(control_frame,
+        # Second row: Performance Metrics, Exit
+        second_row = tk.Frame(control_frame, bg='#f0f0f0')
+        second_row.pack(fill=tk.X)
+
+        # Performance Metrics button
+        tk.Button(second_row,
+                 text="Performance Metrics",
+                 command=self.show_performance_panel,
+                 bg='#98FB98',
+                 **self.button_style).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
+
+        # Exit button - make it more prominent
+        tk.Button(second_row,
                  text="Exit",
                  command=self.station.trigger_exit,
-                 bg='#D3D3D3',
-                 **self.button_style).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5, pady=5)
+                 bg='#FF6B6B',  # Changed to a more prominent red color
+                 fg='black',    # White text for better contrast
+                 **self.button_style).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
 
     def create_workpiece_frame(self):
         # Workpiece control frame
@@ -609,6 +720,18 @@ class ControlPanel:
         except ValueError:
             tk.messagebox.showwarning("Invalid Input", "Please enter a valid number")
 
+    def show_performance_panel(self):
+        """Show the performance metrics panel"""
+        try:
+            # Check if performance panel already exists
+            if hasattr(self, 'performance_panel') and self.performance_panel.root.winfo_exists():
+                self.performance_panel.root.lift()  # Bring to front
+            else:
+                self.performance_panel = PerformancePanel(self.station)
+        except tk.TclError:
+            # Panel was destroyed, create new one
+            self.performance_panel = PerformancePanel(self.station)
+
     def update_status(self):
         # Update workpiece count and state
         self.workpiece_label.config(text=f"{self.station.workpiece_count}")
@@ -628,6 +751,159 @@ class ControlPanel:
 
         # Schedule next update
         self.root.after(100, self.update_status)
+
+
+class PerformancePanel:
+    def __init__(self, station):
+        self.station = station
+        self.root = tk.Toplevel()
+        self.root.title("Performance Metrics")
+        self.root.geometry("800x750")
+        self.root.configure(bg='#f0f0f0')
+
+        # Style configuration
+        self.label_font = ('Arial', 11)
+        self.value_font = ('Arial', 11, 'bold')
+        self.title_font = ('Arial', 13, 'bold')
+
+        # Create main frame with scrollbar
+        main_frame = tk.Frame(self.root, bg='#f0f0f0')
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Create performance metrics display
+        self.create_metrics_display(main_frame)
+
+        # Create export button
+        export_frame = tk.Frame(main_frame, bg='#f0f0f0')
+        export_frame.pack(fill=tk.X, pady=(10, 0))
+
+        tk.Button(export_frame,
+                 text="Export Performance Report",
+                 command=self.export_report,
+                 bg='#87CEEB',
+                 font=self.label_font,
+                 width=25,
+                 pady=5).pack(side=tk.LEFT)
+
+        tk.Button(export_frame,
+                 text="Reset Metrics",
+                 command=self.reset_metrics,
+                 bg='#FFB6C1',
+                 font=self.label_font,
+                 width=25,
+                 pady=5).pack(side=tk.LEFT, padx=(10, 0))
+
+        # Start the update loop
+        self.update_metrics()
+
+    def create_metrics_display(self, parent):
+        # Production Metrics
+        prod_frame = tk.LabelFrame(parent, text="Production Metrics",
+                                  font=self.title_font, bg='#f0f0f0', padx=10, pady=10)
+        prod_frame.pack(fill=tk.X, pady=(0, 10))
+
+        # Create labels for production metrics
+        self.total_workpieces_label = self.create_metric_row(prod_frame, "Total Workpieces Processed:", "0", 0)
+        self.total_cycles_label = self.create_metric_row(prod_frame, "Total Cycles Completed:", "0", 1)
+        self.throughput_label = self.create_metric_row(prod_frame, "Throughput (pieces/hour):", "0.0", 2)
+
+        # Time Metrics
+        time_frame = tk.LabelFrame(parent, text="Time Analysis",
+                                  font=self.title_font, bg='#f0f0f0', padx=10, pady=10)
+        time_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.sim_time_label = self.create_metric_row(time_frame, "Total Simulation Time:", "0.0 s", 0)
+        self.avg_cycle_time_label = self.create_metric_row(time_frame, "Average Cycle Time:", "0.0 s", 1)
+        self.total_downtime_label = self.create_metric_row(time_frame, "Total Downtime:", "0.0 s", 2)
+        self.utilization_label = self.create_metric_row(time_frame, "Equipment Utilization:", "0.0%", 3)
+
+        # Refill Metrics
+        refill_frame = tk.LabelFrame(parent, text="Refill Analysis",
+                                    font=self.title_font, bg='#f0f0f0', padx=10, pady=10)
+        refill_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.refill_count_label = self.create_metric_row(refill_frame, "Number of Refills:", "0", 0)
+        self.avg_refill_time_label = self.create_metric_row(refill_frame, "Average Refill Time:", "0.0 s", 1)
+
+        # State Duration Analysis
+        state_frame = tk.LabelFrame(parent, text="State Duration Analysis",
+                                   font=self.title_font, bg='#f0f0f0', padx=10, pady=10)
+        state_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.state_labels = {}
+        state_names = ["Idle", "Cylinder Extend", "Move to Magazine", "Vacuum ON",
+                      "Cylinder Retract", "Return to Station", "Vacuum OFF"]
+
+        for i, name in enumerate(state_names):
+            self.state_labels[i] = self.create_metric_row(state_frame, f"State {i} ({name}):", "0.0 s", i)
+
+    def create_metric_row(self, parent, label_text, value_text, row):
+        tk.Label(parent, text=label_text, font=self.label_font, bg='#f0f0f0').grid(
+            row=row, column=0, sticky='w', padx=(0, 10), pady=2)
+
+        value_label = tk.Label(parent, text=value_text, font=self.value_font,
+                              bg='#f0f0f0', fg='#0066cc')
+        value_label.grid(row=row, column=1, sticky='w', pady=2)
+
+        return value_label
+
+    def update_metrics(self):
+        metrics = self.station.get_performance_metrics()
+
+        # Update production metrics
+        self.total_workpieces_label.config(text=str(metrics['total_workpieces']))
+        self.total_cycles_label.config(text=str(metrics['total_cycles']))
+        self.throughput_label.config(text=f"{metrics['throughput']:.1f}")
+
+        # Update time metrics
+        self.sim_time_label.config(text=f"{metrics['total_sim_time']:.1f} s")
+        self.avg_cycle_time_label.config(text=f"{metrics['avg_cycle_time']:.1f} s")
+        self.total_downtime_label.config(text=f"{metrics['total_downtime']:.1f} s")
+        self.utilization_label.config(text=f"{metrics['utilization']:.1f}%")
+
+        # Update refill metrics
+        self.refill_count_label.config(text=str(metrics['refill_count']))
+        self.avg_refill_time_label.config(text=f"{metrics['avg_refill_time']:.1f} s")
+
+        # Update state duration metrics
+        for state_id, duration in metrics['state_durations'].items():
+            if state_id in self.state_labels:
+                self.state_labels[state_id].config(text=f"{duration:.1f} s")
+
+        # Schedule next update
+        self.root.after(1000, self.update_metrics)
+
+    def export_report(self):
+        try:
+            metrics = self.station.get_performance_metrics()
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"performance_report_{timestamp}.json"
+
+            # Add timestamp to metrics
+            metrics['export_timestamp'] = datetime.datetime.now().isoformat()
+            metrics['cycle_times_list'] = self.station.cycle_times
+            metrics['refill_times_list'] = self.station.refill_times
+
+            with open(filename, 'w') as f:
+                json.dump(metrics, f, indent=2)
+
+            tk.messagebox.showinfo("Export Successful", f"Performance report exported to {filename}")
+        except Exception as e:
+            tk.messagebox.showerror("Export Error", f"Failed to export report: {str(e)}")
+
+    def reset_metrics(self):
+        if tk.messagebox.askyesno("Reset Metrics", "Are you sure you want to reset all performance metrics?"):
+            # Reset all performance metrics
+            self.station.total_workpieces_processed = 0
+            self.station.total_cycles_completed = 0
+            self.station.simulation_start_time = self.station.env.now
+            self.station.total_downtime = 0
+            self.station.downtime_start = 0
+            self.station.cycle_times = []
+            self.station.refill_times = []
+            self.station.state_durations = {i: 0 for i in range(7)}
+            self.station.last_state_change_time = self.station.env.now
+            tk.messagebox.showinfo("Reset Complete", "All performance metrics have been reset.")
 
 
 if __name__ == "__main__":
