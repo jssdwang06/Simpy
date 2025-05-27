@@ -31,6 +31,15 @@ class FestoStation:
         self.k = False  # need refill
         self.P = False  # memory unit for empty magazine notification
 
+        # ── Workpiece color management ──
+        self.available_colors = ['black', 'red', 'silver']  # Available workpiece colors
+        self.workpiece_colors = {
+            'black': 3,   # Initial count for black workpieces
+            'red': 3,     # Initial count for red workpieces
+            'silver': 2   # Initial count for silver workpieces
+        }
+        self.current_workpiece_color = None  # Color of current workpiece being processed
+
         # ── Position sensors ──
         self.S1 = True   # cylinder retracted
         self.S2 = False  # cylinder extended
@@ -63,6 +72,13 @@ class FestoStation:
         self.state_durations = {i: 0 for i in range(7)}  # Time spent in each state
         self.last_state_change_time = 0  # Track state change timing
 
+        # ── Color processing statistics ──
+        self.processed_colors = {
+            'black': 0,   # Count of processed black workpieces
+            'red': 0,     # Count of processed red workpieces
+            'silver': 0   # Count of processed silver workpieces
+        }
+
         # Histories for plotting
         self.time_history = []
         self.state_history = []
@@ -75,6 +91,35 @@ class FestoStation:
 
         self.time_tolerance = 0.1  # 允许0.1秒的误差范围
         self.last_logic_state = None  # 用于跟踪逻辑状态变化
+
+    def get_next_workpiece_color(self):
+        """Get the color of the next workpiece to be processed"""
+        # Find the first available color with count > 0
+        for color in self.available_colors:
+            if self.workpiece_colors[color] > 0:
+                return color
+        return None
+
+    def eject_workpiece(self):
+        """Eject a workpiece and update color inventory"""
+        next_color = self.get_next_workpiece_color()
+        if next_color:
+            self.current_workpiece_color = next_color
+            self.workpiece_colors[next_color] -= 1
+            self.workpiece_count -= 1
+            self.total_workpieces_processed += 1
+            # Update color processing statistics
+            self.processed_colors[next_color] += 1
+            return True
+        return False
+
+    def get_color_summary(self):
+        """Get a summary string of current color inventory"""
+        summary = []
+        for color in self.available_colors:
+            count = self.workpiece_colors[color]
+            summary.append(f"{color}:{count}")
+        return " | ".join(summary)
 
     def update_state_duration(self, new_state):
         """Update the duration spent in the current state"""
@@ -115,7 +160,8 @@ class FestoStation:
             'total_downtime': self.total_downtime,
             'avg_refill_time': avg_refill_time,
             'refill_count': len(self.refill_times),
-            'state_durations': self.state_durations.copy()
+            'state_durations': self.state_durations.copy(),
+            'processed_colors': self.processed_colors.copy()
         }
 
     # Update logic expression
@@ -147,7 +193,10 @@ class FestoStation:
         self.workpiece_history.append(self.workpiece_count)
         for s in self.sensor_history:    self.sensor_history[s].append(getattr(self, s))
         for a in self.act_history:       self.act_history[a].append(getattr(self, a))
-        print(f"{t:6.1f} | WP={self.workpiece_count:2d} | {msg}")
+
+        # Include color information in log output
+        color_info = self.get_color_summary()
+        print(f"{t:6.1f} | WP={self.workpiece_count:2d} | [{color_info}] | {msg}")
 
     # Start the simulation
     def trigger_start(self):
@@ -279,12 +328,16 @@ class FestoStation:
                     self.P = True  # 置位P信号
                     self.log("Last workpiece ejected - P signal activated")
 
-                self.workpiece_count -= 1
-                self.total_workpieces_processed += 1  # Track processed workpieces
+                # Use new color-aware workpiece ejection
+                if self.eject_workpiece():
+                    color = self.current_workpiece_color
+                    self.log(f"Workpiece ejected by gravity - Color: {color}")
+                else:
+                    self.log("No workpieces available to eject")
+
                 self.S3 = (self.workpiece_count > 0)
                 self.k = not self.S3
                 self.update_logic()
-                # self.log(f"Workpiece ejected by gravity - Count: {self.workpiece_count}")
 
                 # 检查料仓是否为空，如果为空则完成当前循环后停止
                 if not self.S3:
@@ -365,7 +418,7 @@ class FestoStation:
             self.cycle_start_time = 0
             yield from self.run()
 
-    def manual_refill(self, amount):
+    def manual_refill(self, amount, color_distribution=None):
         """Handle manual refill request from control panel"""
         # Check if magazine is empty (S3 is False)
         if self.S3:
@@ -374,6 +427,15 @@ class FestoStation:
         if amount > 0 and amount <= self.max_workpiece_capacity:
             self.manual_refill_flag = True
             self.manual_refill_amount = amount
+
+            # Handle color distribution
+            if color_distribution is None:
+                # Default distribution: try to balance colors
+                self._distribute_colors_evenly(amount)
+            else:
+                # Use provided color distribution
+                self._set_color_distribution(color_distribution)
+
             # Update workpiece count and magazine status
             self.workpiece_count = amount
             self.S3 = True
@@ -384,8 +446,9 @@ class FestoStation:
                 self.P = False
                 self.log("P signal reset - Magazine refilled")
 
-            self.log(f">>> Manual refill completed: {amount} workpieces added")
-            # 回到Idle，等待人工再次启动
+            color_info = self.get_color_summary()
+            self.log(f">>> Manual refill completed: {amount} workpieces added [{color_info}]")
+            # Return to State 0 Idle, waiting for manual start again
             self.state = 0
             self.S1, self.S3, self.S4 = True, True, True
             self.S2 = False
@@ -394,6 +457,32 @@ class FestoStation:
             self.start_event = self.env.event()
             self.update_logic()
             # Note: State 0 log will be output by the main loop
+
+    def _distribute_colors_evenly(self, total_amount):
+        """Distribute workpieces evenly among available colors"""
+        # Reset all colors to 0
+        for color in self.available_colors:
+            self.workpiece_colors[color] = 0
+
+        # Distribute evenly
+        base_amount = total_amount // len(self.available_colors)
+        remainder = total_amount % len(self.available_colors)
+
+        for i, color in enumerate(self.available_colors):
+            self.workpiece_colors[color] = base_amount
+            if i < remainder:  # Distribute remainder to first colors
+                self.workpiece_colors[color] += 1
+
+    def _set_color_distribution(self, color_distribution):
+        """Set specific color distribution"""
+        # Reset all colors to 0
+        for color in self.available_colors:
+            self.workpiece_colors[color] = 0
+
+        # Set specified distribution
+        for color, count in color_distribution.items():
+            if color in self.available_colors:
+                self.workpiece_colors[color] = count
 
 
 # Add workpieces
@@ -547,7 +636,7 @@ class ControlPanel:
         self.station = station
         self.root = tk.Toplevel()
         self.root.title("Festo Station Control Panel")
-        self.root.geometry("600x500")
+        self.root.geometry("600x600")
 
         # Style configuration
         self.style_config()
@@ -571,7 +660,7 @@ class ControlPanel:
         self.root.configure(bg='#f0f0f0')
         self.button_style = {
             'font': ('Arial', 14), # Further increased button font size
-            'width': 15,
+            'width': 20,
             'pady': 5,
             'bd': 2,
             'relief': 'raised'
@@ -631,30 +720,45 @@ class ControlPanel:
         inner_wp_frame = tk.Frame(workpiece_frame, bg='#f0f0f0')
         inner_wp_frame.pack(pady=5, fill=tk.X)
 
-        # Refill amount selection - using grid layout for alignment
+        # Color distribution label
         tk.Label(inner_wp_frame,
-                text="Refill Amount:",
+                text="Color Distribution:",
                 bg='#f0f0f0',
-                font=self.label_font).grid(row=0, column=0, sticky='w')
+                font=self.label_font).grid(row=0, column=0, sticky='w', pady=(0,5))
 
-        self.refill_var = tk.StringVar(value="8")
-        refill_spinbox = tk.Spinbox(inner_wp_frame,
-                                  from_=1,
-                                  to=8,
-                                  textvariable=self.refill_var,
-                                  width=5,
-                                  font=self.label_font)
-        refill_spinbox.grid(row=0, column=1, sticky='w', padx=5)
+        # Color input fields in a single row
+        color_row_frame = tk.Frame(inner_wp_frame, bg='#f0f0f0')
+        color_row_frame.grid(row=1, column=0, columnspan=4, sticky='ew')
 
-        # Manual refill button
-        tk.Button(inner_wp_frame,
+        # Color input fields with default values
+        self.color_vars = {}
+        default_values = {'black': '3', 'red': '3', 'silver': '2'}  # Default balanced distribution
+
+        for i, color in enumerate(self.station.available_colors):
+            tk.Label(color_row_frame,
+                    text=f"{color.capitalize()}:",
+                    bg='#f0f0f0',
+                    font=self.label_font).grid(row=0, column=i*2, sticky='w', padx=(0 if i==0 else 10, 0))
+
+            var = tk.StringVar(value=default_values.get(color, "0"))
+            self.color_vars[color] = var
+            spinbox = tk.Spinbox(color_row_frame,
+                               from_=0,
+                               to=8,
+                               textvariable=var,
+                               width=3,
+                               font=self.label_font)
+            spinbox.grid(row=0, column=i*2+1, sticky='w', padx=(2,0))
+
+        # Manual refill button placed after Silver - aligned with Exit button
+        tk.Button(color_row_frame,
                  text="Manual Refill",
                  command=self.manual_refill,
                  bg='#87CEEB',
-                 **self.button_style).grid(row=0, column=2, sticky='ew', padx=(10,0))
+                 **self.button_style).grid(row=0, column=6, sticky='w', padx=(20,0))
 
         # Configure column weights for proper expansion
-        inner_wp_frame.columnconfigure(2, weight=1)
+        color_row_frame.columnconfigure(6, weight=1)
 
     def create_combined_status_frame(self): # Was create_io_status_frame
         combined_status_frame = tk.LabelFrame(self.root, text="Status", padx=10, pady=10, bg='#f0f0f0', font=self.labelframe_font) # Changed title
@@ -671,6 +775,14 @@ class ControlPanel:
         tk.Label(general_status_frame, text="Current State:", font=self.label_font, bg='#f0f0f0').grid(row=1, column=0, sticky='w')
         self.state_label = tk.Label(general_status_frame, text="N/A", font=self.label_font, bg='#f0f0f0')
         self.state_label.grid(row=1, column=1, sticky='w', padx=5)
+
+        tk.Label(general_status_frame, text="Color Distribution:", font=self.label_font, bg='#f0f0f0').grid(row=2, column=0, sticky='w')
+        self.color_status_label = tk.Label(general_status_frame, text="N/A", font=self.label_font, bg='#f0f0f0')
+        self.color_status_label.grid(row=2, column=1, sticky='w', padx=5)
+
+        tk.Label(general_status_frame, text="Current Color Workpiece:", font=self.label_font, bg='#f0f0f0').grid(row=3, column=0, sticky='w')
+        self.current_workpiece_label = tk.Label(general_status_frame, text="N/A", font=self.label_font, bg='#f0f0f0')
+        self.current_workpiece_label.grid(row=3, column=1, sticky='w', padx=5)
 
         # --- Sensors ---
         sensors_frame = tk.Frame(combined_status_frame, bg='#f0f0f0') # Changed parent to combined_status_frame
@@ -708,17 +820,33 @@ class ControlPanel:
 
     def manual_refill(self):
         try:
-            refill_amount = int(self.refill_var.get())
-            if self.station.S3:  # Changed condition to check S3 directly
+            if self.station.S3:
                 tk.messagebox.showwarning("Invalid State", "Manual refill is only available when magazine is empty")
                 return
 
-            if 1 <= refill_amount <= 8:
-                self.station.manual_refill(refill_amount)
-            else:
-                tk.messagebox.showwarning("Invalid Input", "Please enter a number between 1 and 8")
+            # Get color distribution from input fields
+            color_distribution = {}
+            total_amount = 0
+
+            for color, var in self.color_vars.items():
+                count = int(var.get())
+                if count > 0:
+                    color_distribution[color] = count
+                    total_amount += count
+
+            if total_amount == 0:
+                tk.messagebox.showwarning("Invalid Input", "Please specify at least one workpiece")
+                return
+
+            if total_amount > 8:
+                tk.messagebox.showwarning("Invalid Input", "Total workpieces cannot exceed 8")
+                return
+
+            # Perform color refill with specified distribution
+            self.station.manual_refill(total_amount, color_distribution)
+
         except ValueError:
-            tk.messagebox.showwarning("Invalid Input", "Please enter a valid number")
+            tk.messagebox.showwarning("Invalid Input", "Please enter valid numbers for all colors")
 
     def show_performance_panel(self):
         """Show the performance metrics panel"""
@@ -736,6 +864,14 @@ class ControlPanel:
         # Update workpiece count and state
         self.workpiece_label.config(text=f"{self.station.workpiece_count}")
         self.state_label.config(text=f"{self.station.state}")
+
+        # Update color distribution
+        color_info = self.station.get_color_summary()
+        self.color_status_label.config(text=color_info)
+
+        # Update current workpiece color
+        current_color = self.station.current_workpiece_color or "None"
+        self.current_workpiece_label.config(text=current_color)
 
         # Update sensor indicators
         for s_name, indicator_label in self.sensor_indicators.items():
@@ -768,14 +904,14 @@ class PerformancePanel:
 
         # Create main frame with scrollbar
         main_frame = tk.Frame(self.root, bg='#f0f0f0')
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
         # Create performance metrics display
         self.create_metrics_display(main_frame)
 
         # Create export button
         export_frame = tk.Frame(main_frame, bg='#f0f0f0')
-        export_frame.pack(fill=tk.X, pady=(10, 0))
+        export_frame.pack(fill=tk.X, pady=(5, 0))
 
         tk.Button(export_frame,
                  text="Export Performance Report",
@@ -806,6 +942,11 @@ class PerformancePanel:
         self.total_workpieces_label = self.create_metric_row(prod_frame, "Total Workpieces Processed:", "0", 0)
         self.total_cycles_label = self.create_metric_row(prod_frame, "Total Cycles Completed:", "0", 1)
         self.throughput_label = self.create_metric_row(prod_frame, "Throughput (pieces/hour):", "0.0", 2)
+
+        # Color processing metrics
+        self.black_processed_label = self.create_metric_row(prod_frame, "Black Workpieces Processed:", "0", 3)
+        self.red_processed_label = self.create_metric_row(prod_frame, "Red Workpieces Processed:", "0", 4)
+        self.silver_processed_label = self.create_metric_row(prod_frame, "Silver Workpieces Processed:", "0", 5)
 
         # Time Metrics
         time_frame = tk.LabelFrame(parent, text="Time Analysis",
@@ -855,6 +996,12 @@ class PerformancePanel:
         self.total_cycles_label.config(text=str(metrics['total_cycles']))
         self.throughput_label.config(text=f"{metrics['throughput']:.1f}")
 
+        # Update color processing metrics
+        processed_colors = metrics['processed_colors']
+        self.black_processed_label.config(text=str(processed_colors['black']))
+        self.red_processed_label.config(text=str(processed_colors['red']))
+        self.silver_processed_label.config(text=str(processed_colors['silver']))
+
         # Update time metrics
         self.sim_time_label.config(text=f"{metrics['total_sim_time']:.1f} s")
         self.avg_cycle_time_label.config(text=f"{metrics['avg_cycle_time']:.1f} s")
@@ -903,6 +1050,8 @@ class PerformancePanel:
             self.station.refill_times = []
             self.station.state_durations = {i: 0 for i in range(7)}
             self.station.last_state_change_time = self.station.env.now
+            # Reset color processing statistics
+            self.station.processed_colors = {'black': 0, 'red': 0, 'silver': 0}
             tk.messagebox.showinfo("Reset Complete", "All performance metrics have been reset.")
 
 
