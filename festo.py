@@ -780,6 +780,7 @@ class ControlPanel:
 
         # Color input fields with default values
         self.color_vars = {}
+        self.color_spinboxes = {}  # Store spinbox references for dynamic updates
         default_values = {'black': '3', 'red': '3', 'silver': '2'}  # Default balanced distribution
 
         for i, color in enumerate(self.station.available_colors):
@@ -790,13 +791,20 @@ class ControlPanel:
 
             var = tk.StringVar(value=default_values.get(color, "0"))
             self.color_vars[color] = var
+
+            # Add validation command to update limits when value changes
             spinbox = tk.Spinbox(color_row_frame,
                                from_=0,
                                to=8,
                                textvariable=var,
                                width=3,
-                               font=self.label_font)
+                               font=self.label_font,
+                               command=lambda c=color: self.update_color_limits(c))
             spinbox.grid(row=0, column=i*2+1, sticky='w', padx=(2,0))
+            self.color_spinboxes[color] = spinbox
+
+            # Bind additional events for manual typing
+            var.trace_add('write', lambda *_, c=color: self.update_color_limits(c))
 
         # Manual refill button placed after Silver - aligned with Exit button
         tk.Button(color_row_frame,
@@ -807,6 +815,54 @@ class ControlPanel:
 
         # Configure column weights for proper expansion
         color_row_frame.columnconfigure(6, weight=1)
+
+    def update_color_limits(self, changed_color):
+        """Update the maximum limits for color spinboxes based on current selections"""
+        try:
+            # Calculate current total of all colors
+            current_total = 0
+            color_values = {}
+
+            for color, var in self.color_vars.items():
+                try:
+                    value = int(var.get())
+                    value = max(0, value)  # Ensure non-negative
+                    color_values[color] = value
+                    current_total += value
+                except ValueError:
+                    # If invalid input, treat as 0
+                    color_values[color] = 0
+
+            # If total exceeds 8, revert the changed color to its previous valid value
+            if current_total > 8:
+                # Calculate what the changed color should be to make total = 8
+                other_colors_total = sum(v for k, v in color_values.items() if k != changed_color)
+                max_allowed_for_changed = 8 - other_colors_total
+
+                if max_allowed_for_changed >= 0:
+                    self.color_vars[changed_color].set(str(max_allowed_for_changed))
+                    color_values[changed_color] = max_allowed_for_changed
+                else:
+                    # This shouldn't happen, but as fallback, set to 0
+                    self.color_vars[changed_color].set("0")
+                    color_values[changed_color] = 0
+
+                current_total = sum(color_values.values())
+
+            # Update maximum limits for all spinboxes
+            for color, spinbox in self.color_spinboxes.items():
+                # Calculate remaining capacity for this color
+                other_colors_total = sum(v for k, v in color_values.items() if k != color)
+                max_for_this_color = 8 - other_colors_total
+                max_for_this_color = max(0, max_for_this_color)  # At least 0
+                max_for_this_color = min(8, max_for_this_color)  # At most 8
+
+                spinbox.config(to=max_for_this_color)
+
+        except Exception as e:
+            # Fallback: reset all limits to 8 if something goes wrong
+            for spinbox in self.color_spinboxes.values():
+                spinbox.config(to=8)
 
     def create_combined_status_frame(self): # Was create_io_status_frame
         combined_status_frame = tk.LabelFrame(self.root, text="Status", padx=10, pady=10, bg='#f0f0f0', font=self.labelframe_font) # Changed title
