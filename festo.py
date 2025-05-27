@@ -79,6 +79,10 @@ class FestoStation:
             'silver': 0   # Count of processed silver workpieces
         }
 
+        # ── Refill control ──
+        self.refill_in_progress = False  # Prevent multiple refill operations
+        self.pending_refill_timer = None  # Track active refill timer
+
         # Histories for plotting
         self.time_history = []
         self.state_history = []
@@ -253,7 +257,7 @@ class FestoStation:
                         self.downtime_start = self.env.now
                     # self.log("Magazine empty, K signal activated, waiting for manual refill")
                     while not self.S3:
-                        yield self.env.timeout(0.1)
+                        yield self.env.timeout(0.5)  # Reduced frequency to minimize time drift
                         self.k = not self.S3
                         self.update_logic()
 
@@ -424,9 +428,29 @@ class FestoStation:
         if self.S3:
             self.log("Manual refill only available when magazine is empty")
             return
+
+        # Check if system is in a valid state for refill
+        # Allow refill in State 0 (idle) or State 6 (after last workpiece ejected)
+        if self.state != 0 and not (self.state == 6 and not self.S3):
+            self.log(f"Manual refill only available when system is idle (State 0) or after last workpiece ejected (State 6 with empty magazine)")
+            return
+
+        # Check if refill is already in progress
+        if self.refill_in_progress:
+            self.log("Refill already in progress, please wait")
+            return
+
         if amount > 0 and amount <= self.max_workpiece_capacity:
+            self.refill_in_progress = True
             self.manual_refill_flag = True
             self.manual_refill_amount = amount
+
+            # Record operator response time (time from empty to manual refill click)
+            if self.downtime_start > 0:
+                operator_response_time = self.env.now - self.downtime_start
+                # Round to nearest 0.1s for cleaner display
+                rounded_response_time = round(operator_response_time, 1)
+                self.log(f"Operator response time: {rounded_response_time:.1f}s")
 
             # Handle color distribution
             if color_distribution is None:
@@ -436,6 +460,18 @@ class FestoStation:
                 # Use provided color distribution
                 self._set_color_distribution(color_distribution)
 
+            # Simulate physical refill time (realistic industrial process)
+            physical_refill_time = amount * self.per_workpiece_refill_time
+            self.log(f"Starting physical refill: {amount} workpieces × {self.per_workpiece_refill_time}s = {physical_refill_time:.1f}s")
+
+            # Schedule the completion after physical time
+            self._schedule_refill_completion(amount, physical_refill_time)
+
+    def _schedule_refill_completion(self, amount, physical_time):
+        """Schedule the completion of refill after physical time"""
+        import threading
+
+        def complete_refill():
             # Update workpiece count and magazine status
             self.workpiece_count = amount
             self.S3 = True
@@ -447,7 +483,8 @@ class FestoStation:
                 self.log("P signal reset - Magazine refilled")
 
             color_info = self.get_color_summary()
-            self.log(f">>> Manual refill completed: {amount} workpieces added [{color_info}]")
+            self.log(f">>> Physical refill completed: {amount} workpieces added [{color_info}]")
+
             # Return to State 0 Idle, waiting for manual start again
             self.state = 0
             self.S1, self.S3, self.S4 = True, True, True
@@ -456,7 +493,18 @@ class FestoStation:
             self.S6 = False
             self.start_event = self.env.event()
             self.update_logic()
-            # Note: State 0 log will be output by the main loop
+
+            # Reset refill control flags
+            self.refill_in_progress = False
+            self.pending_refill_timer = None
+
+        # Cancel any existing timer
+        if self.pending_refill_timer:
+            self.pending_refill_timer.cancel()
+
+        # Schedule completion after physical time
+        self.pending_refill_timer = threading.Timer(physical_time, complete_refill)
+        self.pending_refill_timer.start()
 
     def _distribute_colors_evenly(self, total_amount):
         """Distribute workpieces evenly among available colors"""
@@ -499,8 +547,8 @@ def blank_generator(env, station):
 
 
 def run_gui():
-    # SimPy real-time environment
-    env = simpy.rt.RealtimeEnvironment(factor=1.0, strict=True)
+    # SimPy real-time environment with improved precision
+    env = simpy.rt.RealtimeEnvironment(factor=1.0, strict=False)
     station = FestoStation(env)
     # Start the refill process
     env.process(blank_generator(env, station))
@@ -820,8 +868,25 @@ class ControlPanel:
 
     def manual_refill(self):
         try:
+            # Check if magazine is empty
             if self.station.S3:
                 tk.messagebox.showwarning("Invalid State", "Manual refill is only available when magazine is empty")
+                return
+
+            # Check if system is in a valid state for refill
+            # Allow refill in State 0 (idle) or State 6 (after last workpiece ejected)
+            if self.station.state != 0 and not (self.station.state == 6 and not self.station.S3):
+                tk.messagebox.showwarning("Invalid State",
+                                        f"Manual refill only available when:\n"
+                                        f"• System is idle (State 0), or\n"
+                                        f"• After last workpiece ejected (State 6 with empty magazine)\n\n"
+                                        f"Current state: {self.station.state}\n"
+                                        f"Magazine empty: {not self.station.S3}")
+                return
+
+            # Check if refill is already in progress
+            if self.station.refill_in_progress:
+                tk.messagebox.showwarning("Refill In Progress", "A refill operation is already in progress. Please wait.")
                 return
 
             # Get color distribution from input fields
@@ -894,13 +959,13 @@ class PerformancePanel:
         self.station = station
         self.root = tk.Toplevel()
         self.root.title("Performance Metrics")
-        self.root.geometry("800x750")
+        self.root.geometry("800x950")
         self.root.configure(bg='#f0f0f0')
 
-        # Style configuration
-        self.label_font = ('Arial', 11)
-        self.value_font = ('Arial', 11, 'bold')
-        self.title_font = ('Arial', 13, 'bold')
+        # Style configuration - Increased font sizes for better readability
+        self.label_font = ('Arial', 14)        # Increased from 11 to 14
+        self.value_font = ('Arial', 14, 'bold') # Increased from 11 to 14
+        self.title_font = ('Arial', 16, 'bold') # Increased from 13 to 16
 
         # Create main frame with scrollbar
         main_frame = tk.Frame(self.root, bg='#f0f0f0')
@@ -964,7 +1029,15 @@ class PerformancePanel:
         refill_frame.pack(fill=tk.X, pady=(0, 10))
 
         self.refill_count_label = self.create_metric_row(refill_frame, "Number of Refills:", "0", 0)
-        self.avg_refill_time_label = self.create_metric_row(refill_frame, "Average Refill Time:", "0.0 s", 1)
+        self.avg_refill_time_label = self.create_metric_row(refill_frame, "Average Total Refill Time:", "0.0 s", 1)
+
+        # Add note about refill time composition
+        note_label = tk.Label(refill_frame,
+                             text="(Includes: Operator Response + Physical Refill Time)",
+                             font=('Arial', 9, 'italic'),
+                             bg='#f0f0f0',
+                             fg='#666666')
+        note_label.grid(row=2, column=0, columnspan=2, sticky='w', padx=(0, 10), pady=(2, 0))
 
         # State Duration Analysis
         state_frame = tk.LabelFrame(parent, text="State Duration Analysis",
@@ -979,12 +1052,15 @@ class PerformancePanel:
             self.state_labels[i] = self.create_metric_row(state_frame, f"State {i} ({name}):", "0.0 s", i)
 
     def create_metric_row(self, parent, label_text, value_text, row):
-        tk.Label(parent, text=label_text, font=self.label_font, bg='#f0f0f0').grid(
-            row=row, column=0, sticky='w', padx=(0, 10), pady=2)
+        # Create label with fixed width for consistent alignment
+        label = tk.Label(parent, text=label_text, font=self.label_font, bg='#f0f0f0',
+                        width=35, anchor='w')
+        label.grid(row=row, column=0, sticky='w', padx=(0, 5), pady=2)
 
+        # Create value label with fixed width and right alignment
         value_label = tk.Label(parent, text=value_text, font=self.value_font,
-                              bg='#f0f0f0', fg='#0066cc')
-        value_label.grid(row=row, column=1, sticky='w', pady=2)
+                              bg='#f0f0f0', fg='#0066cc', width=12, anchor='e')
+        value_label.grid(row=row, column=1, sticky='w', pady=2, padx=(0, 10))
 
         return value_label
 
@@ -1002,8 +1078,8 @@ class PerformancePanel:
         self.red_processed_label.config(text=str(processed_colors['red']))
         self.silver_processed_label.config(text=str(processed_colors['silver']))
 
-        # Update time metrics
-        self.sim_time_label.config(text=f"{metrics['total_sim_time']:.1f} s")
+        # Update time metrics with industrial-standard formatting
+        self.sim_time_label.config(text=f"{int(round(metrics['total_sim_time']))} s")
         self.avg_cycle_time_label.config(text=f"{metrics['avg_cycle_time']:.1f} s")
         self.total_downtime_label.config(text=f"{metrics['total_downtime']:.1f} s")
         self.utilization_label.config(text=f"{metrics['utilization']:.1f}%")
@@ -1052,6 +1128,11 @@ class PerformancePanel:
             self.station.last_state_change_time = self.station.env.now
             # Reset color processing statistics
             self.station.processed_colors = {'black': 0, 'red': 0, 'silver': 0}
+            # Reset refill control flags
+            self.station.refill_in_progress = False
+            if self.station.pending_refill_timer:
+                self.station.pending_refill_timer.cancel()
+                self.station.pending_refill_timer = None
             tk.messagebox.showinfo("Reset Complete", "All performance metrics have been reset.")
 
 
