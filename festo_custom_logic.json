@@ -1,0 +1,186 @@
+{
+  "inputs": {
+    "S1": {
+      "description": "气缸收回位置传感器",
+      "type": "bool",
+      "value": false
+    },
+    "S2": {
+      "description": "气缸伸出位置传感器",
+      "type": "bool",
+      "value": false
+    },
+    "S3": {
+      "description": "料仓非空传感器",
+      "type": "bool",
+      "value": false
+    },
+    "S4": {
+      "description": "机械手在下游位置传感器",
+      "type": "bool",
+      "value": false
+    },
+    "S5": {
+      "description": "机械手在料仓位置传感器",
+      "type": "bool",
+      "value": false
+    },
+    "S6": {
+      "description": "真空吸盘工作传感器",
+      "type": "bool",
+      "value": false
+    },
+    "k": {
+      "description": "需要补料信号",
+      "type": "bool",
+      "value": false
+    },
+    "P": {
+      "description": "料仓空报警信号",
+      "type": "bool",
+      "value": false
+    },
+    "state": {
+      "description": "当前状态",
+      "type": "int",
+      "value": 0
+    },
+    "emergency": {
+      "description": "急停信号",
+      "type": "bool",
+      "value": false
+    }
+  },
+  "outputs": {
+    "Y1": {
+      "description": "气缸控制",
+      "type": "bool",
+      "value": false
+    },
+    "Y2": {
+      "description": "机械手控制",
+      "type": "bool",
+      "value": false
+    },
+    "Y3": {
+      "description": "真空控制",
+      "type": "bool",
+      "value": false
+    },
+    "alarm": {
+      "description": "报警输出",
+      "type": "bool",
+      "value": false
+    }
+  },
+  "logic_rules": {
+    "k": {
+      "expression": "not S3",
+      "description": "补料信号等于料仓空信号"
+    },
+    "alarm": {
+      "expression": "emergency or P",
+      "description": "急停或料仓空时报警"
+    }
+  },
+  "state_conditions": {
+    "0": {
+      "Y1": {
+        "expression": "False",
+        "description": "空闲状态气缸控制关闭"
+      },
+      "Y2": {
+        "expression": "False",
+        "description": "空闲状态机械手控制关闭"
+      },
+      "Y3": {
+        "expression": "False",
+        "description": "空闲状态真空控制关闭"
+      }
+    },
+    "1": {
+      "Y1": {
+        "expression": "(S2 or ((not S6) and k)) and (not emergency)",
+        "description": "工作状态1气缸控制逻辑(增加急停保护)"
+      },
+      "Y2": {
+        "expression": "(not S1) and (not S4) and (not emergency)",
+        "description": "工作状态1机械手控制逻辑(增加急停保护)"
+      },
+      "Y3": {
+        "expression": "(not S4) and (((not S1) and S5) or (S1 and (not S5))) and (not emergency)",
+        "description": "工作状态1真空控制逻辑(增加急停保护)"
+      }
+    },
+    "2": {
+      "Y1": {
+        "expression": "(S2 or ((not S6) and k)) and (not emergency)",
+        "description": "工作状态2气缸控制逻辑(增加急停保护)"
+      },
+      "Y2": {
+        "expression": "(not S1) and (not S4) and (not emergency)",
+        "description": "工作状态2机械手控制逻辑(增加急停保护)"
+      },
+      "Y3": {
+        "expression": "(not S4) and (((not S1) and S5) or (S1 and (not S5))) and (not emergency)",
+        "description": "工作状态2真空控制逻辑(增加急停保护)"
+      }
+    },
+    "3": {
+      "Y1": {
+        "expression": "(S2 or ((not S6) and k)) and (not emergency)",
+        "description": "工作状态3气缸控制逻辑(增加急停保护)"
+      },
+      "Y2": {
+        "expression": "(not S1) and (not S4) and (not emergency)",
+        "description": "工作状态3机械手控制逻辑(增加急停保护)"
+      },
+      "Y3": {
+        "expression": "(not S4) and (((not S1) and S5) or (S1 and (not S5))) and (not emergency)",
+        "description": "工作状态3真空控制逻辑(增加急停保护)"
+      }
+    },
+    "4": {
+      "Y1": {
+        "expression": "(S2 or ((not S6) and k)) and (not emergency)",
+        "description": "工作状态4气缸控制逻辑(增加急停保护)"
+      },
+      "Y2": {
+        "expression": "(not S1) and (not S4) and (not emergency)",
+        "description": "工作状态4机械手控制逻辑(增加急停保护)"
+      },
+      "Y3": {
+        "expression": "(not S4) and (((not S1) and S5) or (S1 and (not S5))) and (not emergency)",
+        "description": "工作状态4真空控制逻辑(增加急停保护)"
+      }
+    },
+    "5": {
+      "Y1": {
+        "expression": "(S2 or ((not S6) and k)) and (not emergency)",
+        "description": "工作状态5气缸控制逻辑(增加急停保护)"
+      },
+      "Y2": {
+        "expression": "(not S1) and (not S4) and (not emergency)",
+        "description": "工作状态5机械手控制逻辑(增加急停保护)"
+      },
+      "Y3": {
+        "expression": "(not S4) and (((not S1) and S5) or (S1 and (not S5))) and (not emergency)",
+        "description": "工作状态5真空控制逻辑(增加急停保护)"
+      }
+    },
+    "6": {
+      "Y1": {
+        "expression": "(S2 or ((not S6) and k)) and (not emergency)",
+        "description": "工作状态6气缸控制逻辑(增加急停保护)"
+      },
+      "Y2": {
+        "expression": "(not S1) and (not S4) and (not emergency)",
+        "description": "工作状态6机械手控制逻辑(增加急停保护)"
+      },
+      "Y3": {
+        "expression": "(not S4) and (((not S1) and S5) or (S1 and (not S5))) and (not emergency)",
+        "description": "工作状态6真空控制逻辑(增加急停保护)"
+      }
+    }
+  }
+}

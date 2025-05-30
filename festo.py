@@ -1,5 +1,6 @@
 import threading # multi-threaded
 import sys # exit
+import os # file operations
 import simpy # real-time simulation
 from simpy.rt import RealtimeEnvironment # real-time simulation, 1s simulation = 1s real-time, if the simulation runs faster than real-time, an exception is raised
 import matplotlib.pyplot as plt  # for plotting
@@ -10,11 +11,261 @@ import tkinter.messagebox
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import json
 import datetime
+import re
+from typing import Dict, List, Any
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 🔧 可配置逻辑引擎 (Configurable Logic Engine)
+# ═══════════════════════════════════════════════════════════════════
+
+class LogicExpression:
+    """逻辑表达式类 - 支持动态解析和执行布尔表达式"""
+
+    def __init__(self, expression: str, description: str = ""):
+        self.expression = expression
+        self.description = description
+        self.variables = self._extract_variables()
+
+    def _extract_variables(self) -> List[str]:
+        """从表达式中提取变量名"""
+        # 匹配所有可能的变量名 (字母开头，可包含数字和下划线)
+        pattern = r'\b[a-zA-Z][a-zA-Z0-9_]*\b'
+        variables = re.findall(pattern, self.expression)
+        # 过滤掉Python关键字
+        keywords = {'and', 'or', 'not', 'True', 'False'}
+        return [var for var in set(variables) if var not in keywords]
+
+    def evaluate(self, context: Dict[str, Any]) -> bool:
+        """在给定上下文中计算表达式的值"""
+        try:
+            # 创建安全的执行环境
+            safe_dict = {
+                '__builtins__': {},
+                'True': True,
+                'False': False,
+                'and': lambda a, b: a and b,
+                'or': lambda a, b: a or b,
+                'not': lambda a: not a,
+            }
+
+            # 添加上下文变量
+            for var in self.variables:
+                if var in context:
+                    safe_dict[var] = context[var]
+                else:
+                    safe_dict[var] = False  # 默认值
+
+            # 执行表达式
+            result = eval(self.expression, safe_dict)
+            return bool(result)
+        except Exception as e:
+            print(f"Logic expression error: {e}")
+            return False
+
+
+class LogicConfiguration:
+    """逻辑配置管理器 - 管理所有输入输出逻辑关系"""
+
+    def __init__(self):
+        self.input_definitions = {}   # 输入信号定义
+        self.output_definitions = {}  # 输出信号定义
+        self.logic_rules = {}         # 逻辑规则
+        self.state_conditions = {}    # 状态相关条件
+
+    def define_input(self, name: str, description: str, data_type: str = "bool"):
+        """定义输入信号"""
+        self.input_definitions[name] = {
+            'description': description,
+            'type': data_type,
+            'value': False if data_type == "bool" else 0
+        }
+
+    def define_output(self, name: str, description: str, data_type: str = "bool"):
+        """定义输出信号"""
+        self.output_definitions[name] = {
+            'description': description,
+            'type': data_type,
+            'value': False if data_type == "bool" else 0
+        }
+
+    def add_logic_rule(self, output_name: str, expression: str, description: str = ""):
+        """添加逻辑规则"""
+        self.logic_rules[output_name] = LogicExpression(expression, description)
+
+    def add_state_condition(self, state: int, conditions: Dict[str, str]):
+        """添加状态相关的条件"""
+        self.state_conditions[state] = {}
+        for output_name, expression in conditions.items():
+            self.state_conditions[state][output_name] = LogicExpression(expression)
+
+    def evaluate_logic(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """计算所有逻辑规则"""
+        results = {}
+        current_state = context.get('state', 0)
+
+        # 首先应用状态相关的条件
+        if current_state in self.state_conditions:
+            for output_name, expression in self.state_conditions[current_state].items():
+                results[output_name] = expression.evaluate(context)
+
+        # 然后应用通用逻辑规则
+        for output_name, expression in self.logic_rules.items():
+            if output_name not in results:  # 状态条件优先
+                results[output_name] = expression.evaluate(context)
+
+        return results
+
+    def save_configuration(self, filename: str):
+        """保存配置到JSON文件"""
+        config = {
+            'inputs': self.input_definitions,
+            'outputs': self.output_definitions,
+            'logic_rules': {name: {'expression': expr.expression, 'description': expr.description}
+                           for name, expr in self.logic_rules.items()},
+            'state_conditions': {
+                str(state): {name: {'expression': expr.expression, 'description': expr.description}
+                           for name, expr in conditions.items()}
+                for state, conditions in self.state_conditions.items()
+            }
+        }
+
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+
+    def load_configuration(self, filename: str):
+        """从JSON文件加载配置"""
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+
+            self.input_definitions = config.get('inputs', {})
+            self.output_definitions = config.get('outputs', {})
+
+            # 重建逻辑规则
+            self.logic_rules = {}
+            for name, rule_data in config.get('logic_rules', {}).items():
+                self.logic_rules[name] = LogicExpression(
+                    rule_data['expression'],
+                    rule_data.get('description', '')
+                )
+
+            # 重建状态条件
+            self.state_conditions = {}
+            for state_str, conditions in config.get('state_conditions', {}).items():
+                state = int(state_str)
+                self.state_conditions[state] = {}
+                for name, condition_data in conditions.items():
+                    self.state_conditions[state][name] = LogicExpression(
+                        condition_data['expression'],
+                        condition_data.get('description', '')
+                    )
+
+        except Exception as e:
+            print(f"Error loading configuration: {e}")
+
+
+class ConfigurableLogicEngine:
+    """可配置逻辑引擎 - 核心执行引擎"""
+
+    def __init__(self, config: LogicConfiguration):
+        self.config = config
+        self.current_context = {}
+        self.history = []
+
+    def update_context(self, **kwargs):
+        """更新执行上下文"""
+        self.current_context.update(kwargs)
+
+    def execute_logic(self) -> Dict[str, Any]:
+        """执行逻辑计算"""
+        results = self.config.evaluate_logic(self.current_context)
+
+        # 记录历史
+        self.history.append({
+            'timestamp': len(self.history),
+            'context': self.current_context.copy(),
+            'results': results.copy()
+        })
+
+        return results
+
+    def get_variable_info(self, var_name: str) -> Dict[str, Any]:
+        """获取变量信息"""
+        if var_name in self.config.input_definitions:
+            return {'type': 'input', **self.config.input_definitions[var_name]}
+        elif var_name in self.config.output_definitions:
+            return {'type': 'output', **self.config.output_definitions[var_name]}
+        else:
+            return {'type': 'unknown', 'description': 'Unknown variable'}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 🏭 Festo工作站默认逻辑配置
+# ═══════════════════════════════════════════════════════════════════
+
+def create_festo_default_config() -> LogicConfiguration:
+    """创建Festo工作站的默认逻辑配置"""
+    config = LogicConfiguration()
+
+    # 定义输入信号 (传感器)
+    config.define_input('S1', '气缸收回位置传感器')
+    config.define_input('S2', '气缸伸出位置传感器')
+    config.define_input('S3', '料仓非空传感器')
+    config.define_input('S4', '机械手在下游位置传感器')
+    config.define_input('S5', '机械手在料仓位置传感器')
+    config.define_input('S6', '真空吸盘工作传感器')
+    config.define_input('k', '需要补料信号')
+    config.define_input('P', '料仓空报警信号')
+    config.define_input('state', '当前状态', 'int')
+
+    # 定义输出信号 (执行器)
+    config.define_output('Y1', '气缸控制')
+    config.define_output('Y2', '机械手控制')
+    config.define_output('Y3', '真空控制')
+
+    # 定义状态相关的逻辑条件
+    # 状态0: 空闲状态 - 所有执行器关闭
+    config.add_state_condition(0, {
+        'Y1': 'False',
+        'Y2': 'False',
+        'Y3': 'False'
+    })
+
+    # 状态1-6: 工作状态 - 使用复杂逻辑
+    for state in range(1, 7):
+        config.add_state_condition(state, {
+            'Y1': 'S2 or ((not S6) and k)',
+            'Y2': '(not S1) and (not S4)',
+            'Y3': '(not S4) and (((not S1) and S5) or (S1 and (not S5)))'
+        })
+
+    # 添加通用逻辑规则
+    config.add_logic_rule('k', 'not S3', '补料信号等于料仓空信号')
+
+    return config
 
 
 class FestoStation:
-    def __init__(self, env):
+    def __init__(self, env, logic_config_file: str = None):
         self.env = env
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 🔧 可配置逻辑引擎初始化
+        # ═══════════════════════════════════════════════════════════════════
+
+        # 创建或加载逻辑配置
+        if logic_config_file and os.path.exists(logic_config_file):
+            self.logic_config = LogicConfiguration()
+            self.logic_config.load_configuration(logic_config_file)
+            print(f"Loaded logic configuration from: {logic_config_file}")
+        else:
+            self.logic_config = create_festo_default_config()
+            print("Using default Festo logic configuration")
+
+        # 初始化逻辑引擎
+        self.logic_engine = ConfigurableLogicEngine(self.logic_config)
+
         # ── Time parameters ──
         self.extend_time = 2   # cylinder extend/retract time
         self.move_time = 3     # manipulator movement time
@@ -168,22 +419,60 @@ class FestoStation:
             'processed_colors': self.processed_colors.copy()
         }
 
-    # Update logic expression
-    def update_logic(self):
-        self.k = not self.S3  # k is always the inverse of S3
+    # ═══════════════════════════════════════════════════════════════════
+    # 🔧 可配置逻辑更新方法 (Configurable Logic Update)
+    # ═══════════════════════════════════════════════════════════════════
 
-        # Actuator Logic
-        if self.state == 0:  # Idle State
-            self.Y1 = False
-            self.Y2 = False
-            self.Y3 = False
-        else: # Active States (1-6)
-            # Y1 = S2 or ((not S6) and k)
-            self.Y1 = self.S2 or ((not self.S6) and self.k)
-            # Y2 = (not S1) and (not S4)
-            self.Y2 = (not self.S1) and (not self.S4)
-            # Y3 = (not S4) and (((not S1) and S5) or (S1 and (not S5)))
-            self.Y3 = (not self.S4) and (((not self.S1) and self.S5) or (self.S1 and (not self.S5)))
+    def update_logic(self):
+        """使用可配置逻辑引擎更新控制逻辑"""
+        # 更新逻辑引擎的上下文
+        self.logic_engine.update_context(
+            S1=self.S1, S2=self.S2, S3=self.S3, S4=self.S4, S5=self.S5, S6=self.S6,
+            k=self.k, P=self.P, state=self.state,
+            workpiece_count=self.workpiece_count,
+            emergency_flag=self.emergency_flag,
+            emergency=self.emergency_flag  # 添加emergency别名以匹配配置文件
+        )
+
+        # 执行逻辑计算
+        results = self.logic_engine.execute_logic()
+
+        # 应用计算结果到执行器
+        self.Y1 = results.get('Y1', False)
+        self.Y2 = results.get('Y2', False)
+        self.Y3 = results.get('Y3', False)
+
+        # 更新计算出的信号
+        self.k = results.get('k', not self.S3)  # 默认逻辑：k = not S3
+
+        # 可选：记录逻辑变化
+        current_logic_state = (self.Y1, self.Y2, self.Y3, self.k)
+        if current_logic_state != self.last_logic_state:
+            self.last_logic_state = current_logic_state
+            # 可以在这里添加逻辑变化的日志记录
+
+    def save_logic_configuration(self, filename: str):
+        """保存当前逻辑配置到文件"""
+        self.logic_config.save_configuration(filename)
+        print(f"Logic configuration saved to: {filename}")
+
+    def load_logic_configuration(self, filename: str):
+        """从文件加载逻辑配置"""
+        self.logic_config.load_configuration(filename)
+        self.logic_engine = ConfigurableLogicEngine(self.logic_config)
+        print(f"Logic configuration loaded from: {filename}")
+
+    def get_logic_info(self) -> Dict[str, Any]:
+        """获取当前逻辑配置信息"""
+        return {
+            'inputs': list(self.logic_config.input_definitions.keys()),
+            'outputs': list(self.logic_config.output_definitions.keys()),
+            'logic_rules': {name: expr.expression for name, expr in self.logic_config.logic_rules.items()},
+            'state_conditions': {
+                state: {name: expr.expression for name, expr in conditions.items()}
+                for state, conditions in self.logic_config.state_conditions.items()
+            }
+        }
 
     # Record the history during simulation and output information
     def log(self, msg):  # formatted log output
